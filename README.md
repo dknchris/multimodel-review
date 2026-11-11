@@ -15,7 +15,7 @@ It needs Python 3, git and the Codex CLI.
 
 - `/multimodel-review` starts the default panel: `terra:max:fast opus:xhigh rounds:26`.
 - `/multimodel-review astra:high fable sol:fast rounds:12` starts your own panel. Each reviewer is `name[:effort][:fast]`, and effort is low, medium, high, xhigh or max.
-- Reviewers: Codex terra, astra, luna and sol, and Claude opus, fable, sonnet and haiku. Fast mode is for the Codex models only.
+- Reviewers: Codex terra, astra, sol and luna, and Claude opus, fable, sonnet and haiku. Fast mode is for the Codex models only.
 - `/multimodel-review pick` opens a picker.
 
 ## Test

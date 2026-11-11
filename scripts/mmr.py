@@ -28,7 +28,7 @@ MODELS = {"terra": "gpt-6.1-terra", "astra": "gpt-6-astra", "sol": "gpt-6.1-sol"
 # Claude reviewers run as the multimodel-reviewer Agent with this model. "claude" is the Opus reviewer of older runs.
 AGENT_MODEL = {"opus": "opus", "fable": "fable", "sonnet": "sonnet", "haiku": "haiku", "claude": "opus"}
 REVIEWERS = ["terra", "opus"]  # Default panel.
-ALL_REVIEWERS = ["terra", "opus", "astra", "fable", "sonnet", "haiku", "luna", "sol"]  # Picker order.
+ALL_REVIEWERS = ["terra", "opus", "fable", "astra", "sol", "sonnet", "haiku", "luna"]  # Picker order.
 EFFORTS = ["low", "medium", "high", "xhigh", "max"]  # Codex "ultra" delegates to subagents, which stay off.
 OLD_REVIEWERS = ["sol", "terra", "claude"]  # Runs from before Sol was dropped keep their panel.
 EFFORT = os.environ.get("MMR_EFFORT", "max")  # Default Codex effort; a run's own choice wins.

@@ -265,8 +265,20 @@ def picker_tests(tmp):
     import base64
     import hashlib
     import shutil
+    import re
     root = Path(MMR).parent.parent
     js = (root / "assets" / "picker.js").read_bytes()
+
+    # The picker offers exactly the helper's reviewers, in its order, with its defaults.
+    spec = importlib.util.spec_from_file_location("mmr", MMR)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    rows = re.findall(r"\['(\w+)','\w+','[\w.-]+','([gc])','(\w+)','([\w.]*)',([01]),([01])\]", js.decode())
+    check([r[0] for r in rows] == mod.ALL_REVIEWERS, "picker lists every reviewer in the helper's order")
+    check(all((r[1] == "g") == bool(r[3]) == (r[0] in mod.MODELS) for r in rows),
+          "only Codex models get the OpenAI logo and fast mode")
+    picked = " ".join(r[0] + ":" + r[2] + (":fast" if r[3] and r[5] == "1" else "") for r in rows if r[4] == "1")
+    check(picked == mod.DEFAULT_SPEC, "picker starts with the default panel")
 
     def skill_at(folder):
         (folder / "scripts").mkdir(parents=True)
