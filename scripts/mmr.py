@@ -21,7 +21,7 @@ from pathlib import Path
 SKILL_DIR = Path(__file__).resolve().parent.parent
 RULES_FILE = SKILL_DIR / "assets" / "reviewer-rules.md"
 PICKER_JS = "assets/picker.js"
-PICKER_TITLE = "Options for a new multi-model review: Reviewers with effort and fast mode for each, and round limit."
+PICKER_TITLE = "Options for a new multi-model review: Reviewers with effort and fast mode for each, and review length."
 RUNS_HOME = Path(os.environ.get("MMR_RUNS_HOME", Path.home() / ".claude" / "multimodel-review"))
 
 MODELS = {"terra": "gpt-6.1-terra", "astra": "gpt-6-astra", "sol": "gpt-6.1-sol", "luna": "gpt-6-luna"}
@@ -42,7 +42,11 @@ QUIET_SECONDS = int(os.environ.get("MMR_QUIET_SECONDS", "240"))
 MONITOR_CAP_SECONDS = int(os.environ.get("MMR_MONITOR_CAP_SECONDS", str(28 * 60)))
 MAX_ATTEMPTS = 2
 CAPS = {"code": 20, "docs": 2, "final": 2}
-HARD_STOP = 26  # 20 Code + 2 Docs + 2 Final + 2 spare.
+SPARE = 2  # Rounds on top of the phase caps, for evidence rounds after a device test.
+HARD_STOP = 26  # Default limit: 20 Code + 2 Docs + 2 Final + 2 spare.
+CODE_RANGE = (20, 50)  # A run's Code cap, set with code:<n>.
+SPARE_RANGE = (2, 6)  # A run's spare rounds, set with spare:<n>.
+MAX_LIMIT = CODE_RANGE[1] + CAPS["docs"] + CAPS["final"] + SPARE_RANGE[1]
 OLD_CAPS = {"code": 12, "docs": 2, "final": 2}  # Runs saved before the caps were stored keep these.
 OLD_HARD_STOP = 18
 ALLOWED = {
@@ -137,7 +141,10 @@ def effort_for(s, who):
 def settings_line(s):
     names = [f"{r} ({effort_for(s, r)}" + (f", {'fast' if is_fast(s, r) else 'standard'})" if r in MODELS else ")")
              for r in panel(s)]
-    return f"Settings: Reviewers {', '.join(names)}; round limit {max_rounds(s)}"
+    c = caps(s)
+    spare = max_rounds(s) - sum(c.values())
+    return (f"Settings: Reviewers {', '.join(names)}; round limit {max_rounds(s)} "
+            f"(Code {c['code']}, Docs {c['docs']}, Final {c['final']}" + (f", Spare {spare})" if spare >= 0 else ")"))
 
 
 def old_location_note(top, run):
@@ -291,8 +298,9 @@ def find_base(top):
 
 
 def parse_spec(text):
-    """Read typed options like "terra:max:fast opus:xhigh rounds:26". Fast only when :fast is given."""
-    reviewers, effort, fast, rounds = [], {}, [], HARD_STOP
+    """Read typed options like "terra:max:fast opus:xhigh code:20 spare:2". Fast only when :fast is given.
+    Returns the reviewers, their effort, the fast ones, the phase caps and the round limit."""
+    reviewers, effort, fast, size = [], {}, [], {"code": CAPS["code"], "spare": SPARE}
     for tok in re.split(r"[\s,]+", (text or "").strip().rstrip(".").lower()):
         if not tok:
             continue
@@ -300,9 +308,13 @@ def parse_spec(text):
         if name in ("pick", "picker"):
             raise ValueError(f"{tok}: Use it alone to open the picker, like /multimodel-review pick.")
         if name == "rounds":
-            if len(parts) != 1 or not parts[0].isdigit() or not 1 <= int(parts[0]) <= HARD_STOP:
-                raise ValueError(f"{tok}: Use rounds:<1-{HARD_STOP}>, like rounds:12.")
-            rounds = int(parts[0])
+            raise ValueError(f"{tok}: Use code:<{CODE_RANGE[0]}-{CODE_RANGE[1]}> and "
+                             f"spare:<{SPARE_RANGE[0]}-{SPARE_RANGE[1]}> instead, like code:35 spare:2.")
+        if name in size:
+            lo, hi = CODE_RANGE if name == "code" else SPARE_RANGE
+            if len(parts) != 1 or not parts[0].isdigit() or not lo <= int(parts[0]) <= hi:
+                raise ValueError(f"{tok}: Use {name}:<{lo}-{hi}>, like {name}:{lo}.")
+            size[name] = int(parts[0])
             continue
         who = "opus" if name == "claude" else name
         if who not in ALL_REVIEWERS:
@@ -323,22 +335,24 @@ def parse_spec(text):
                 raise ValueError(f"{tok}: Unknown or repeated option '{part}'. "
                                  f"Effort is {', '.join(EFFORTS)}; Codex models also take fast.")
     if not reviewers:
-        reviewers, effort, fast, _ = parse_spec(DEFAULT_SPEC)
-    return reviewers, effort, fast, rounds
+        reviewers, effort, fast, _, _ = parse_spec(DEFAULT_SPEC)
+    run_caps = {**CAPS, "code": size["code"]}
+    return reviewers, effort, fast, run_caps, sum(run_caps.values()) + size["spare"]
 
 
-def spec_text(reviewers, effort, fast, rounds):
-    return " ".join(r + f":{effort[r]}" + (":fast" if r in fast else "")
-                    for r in reviewers) + f" rounds:{rounds}"
+def spec_text(reviewers, effort, fast, run_caps, limit):
+    return " ".join(r + f":{effort[r]}" + (":fast" if r in fast else "") for r in reviewers) + \
+        f" code:{run_caps['code']} spare:{limit - sum(run_caps.values())}"
 
 
 def cmd_options(a):
     try:
-        reviewers, effort, fast, rounds = parse_spec(a.spec)
+        reviewers, effort, fast, run_caps, limit = parse_spec(a.spec)
     except ValueError as e:
         die(str(e))
-    print(settings_line({"reviewers": reviewers, "effort": effort, "fast": fast, "max_rounds": rounds}))
-    print(f'Init: --spec "{spec_text(reviewers, effort, fast, rounds)}"')
+    print(settings_line({"reviewers": reviewers, "effort": effort, "fast": fast,
+                         "caps": run_caps, "max_rounds": limit}))
+    print(f'Init: --spec "{spec_text(reviewers, effort, fast, run_caps, limit)}"')
 
 
 def picker_url(js):
@@ -388,8 +402,8 @@ def init_flags(a):
                                    for r in a.reviewers.split(",") if r.strip()))
     if not reviewers or set(reviewers) - set(ALL_REVIEWERS):
         die(f"--reviewers takes a comma-separated list from: {', '.join(ALL_REVIEWERS)}")
-    if not 1 <= a.max_rounds <= HARD_STOP:
-        die(f"--max-rounds must be 1 to {HARD_STOP}.")
+    if not 1 <= a.max_rounds <= MAX_LIMIT:
+        die(f"--max-rounds must be 1 to {MAX_LIMIT}.")
     codex = [r for r in reviewers if r in MODELS]
     if a.fast in ("on", "off"):
         fast = codex if a.fast == "on" else []
@@ -405,7 +419,7 @@ def init_flags(a):
             die(f"--effort takes reviewer=level pairs for this run's reviewers ({', '.join(reviewers)}), "
                 f"with levels {', '.join(EFFORTS)}. Got: {item}")
         effort[who] = level
-    return reviewers, effort, fast, a.max_rounds
+    return reviewers, effort, fast, CAPS, a.max_rounds
 
 
 def cmd_init(a):
@@ -416,11 +430,11 @@ def cmd_init(a):
         die("An unfinished run exists. Continue it with `mmr.py status`, or pass --new.")
     if a.spec is not None:
         try:
-            reviewers, effort, fast, rounds = parse_spec(a.spec)
+            reviewers, effort, fast, run_caps, rounds = parse_spec(a.spec)
         except ValueError as e:
             die(str(e))
     else:
-        reviewers, effort, fast, rounds = init_flags(a)
+        reviewers, effort, fast, run_caps, rounds = init_flags(a)
     branch = git(top, "symbolic-ref", "--short", "-q", "HEAD", check=False)
     base = a.base or find_base(top)
     if not git(top, "rev-parse", "--verify", "-q", f"{base}^{{commit}}", check=False):
@@ -474,7 +488,7 @@ def cmd_init(a):
     (run / "rounds.tsv").write_text("\t".join(ROUND_COLS) + "\n")
     save(run, {
         "repo": str(top), "branch": branch, "base": base, "base_commit": merge_base,
-        "reviewers": reviewers, "fast": fast, "effort": effort, "max_rounds": rounds, "caps": CAPS,
+        "reviewers": reviewers, "fast": fast, "effort": effort, "max_rounds": rounds, "caps": run_caps,
         "start_head": head, "started_at": now(), "rounds": 0,
         "created_branch": created, "snapshot_commit": snapshot, "left_out": left_out,
         "phase_rounds": {"code": 0, "docs": 0, "final": 0, "evidence": 0},
@@ -1051,7 +1065,7 @@ def main():
     c.add_argument("--effort", help="Per-reviewer effort, such as terra=max,opus=high")
     c.add_argument("--reviewers", default=",".join(REVIEWERS))
     c.add_argument("--max-rounds", type=int, default=HARD_STOP)
-    c.add_argument("--spec", help='Typed options, such as "terra:max:fast opus:xhigh rounds:26"; replaces the flags above')
+    c.add_argument("--spec", help='Typed options, such as "terra:max:fast opus:xhigh code:20 spare:2"; replaces the flags above')
     c.set_defaults(fn=cmd_init)
     c = sub.add_parser("options")
     c.add_argument("spec", nargs="?", default="")

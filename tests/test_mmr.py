@@ -279,6 +279,14 @@ def picker_tests(tmp):
           "only Codex models get the OpenAI logo and fast mode")
     picked = " ".join(r[0] + ":" + r[2] + (":fast" if r[3] and r[5] == "1" else "") for r in rows if r[4] == "1")
     check(picked == mod.DEFAULT_SPEC, "picker starts with the default panel")
+    text = js.decode()
+    start = re.search(r"S=\{preset:'standard',code:(\d+),spare:(\d+)\}", text)
+    check(start and (int(start[1]), int(start[2])) == (mod.CAPS["code"], mod.SPARE), "picker starts with Code 20, Spare 2")
+    ranges = dict((m[0], (int(m[1]), int(m[2]))) for m in re.findall(r"\['(code|spare)','\w+','[^']+',(\d+),(\d+),", text))
+    check(ranges == {"code": mod.CODE_RANGE, "spare": mod.SPARE_RANGE}, "picker steppers use the helper's ranges")
+    presets = [int(c) for c in re.findall(r"\['(?:standard|long|max)','\w+',(\d+)\]", text)]
+    check(len(presets) == 3 and all(mod.CODE_RANGE[0] <= c <= mod.CODE_RANGE[1] for c in presets),
+          "picker presets are valid Code caps")
 
     def skill_at(folder):
         (folder / "scripts").mkdir(parents=True)
@@ -708,13 +716,15 @@ def main():
 
     # Typed options: name[:effort][:fast], fast only when asked, rounds optional.
     cases = {
-        "terra:max:fast opus:xhigh rounds:26": "Reviewers terra (max, fast), opus (xhigh); round limit 26",
+        "terra:max:fast opus:xhigh code:20 spare:2": "Reviewers terra (max, fast), opus (xhigh); round limit 26 "
+                                                     "(Code 20, Docs 2, Final 2, Spare 2)",
         "terra:fast opus": "Reviewers terra (max, fast), opus (xhigh); round limit 26",
         "terra:high astra:max": "Reviewers terra (high, standard), astra (max, standard); round limit 26",
         "": "Reviewers terra (max, fast), opus (xhigh); round limit 26",
-        "rounds:6": "Reviewers terra (max, fast), opus (xhigh); round limit 6",
+        "code:35": "Reviewers terra (max, fast), opus (xhigh); round limit 41 (Code 35, Docs 2, Final 2, Spare 2)",
+        "terra code:50 spare:6": "round limit 60 (Code 50, Docs 2, Final 2, Spare 6)",
         "Terra:MAX:Fast, Opus": "Reviewers terra (max, fast), opus (xhigh); round limit 26",
-        "terra:max opus:xhigh luna:low:fast rounds:6.": "luna (low, fast); round limit 6",
+        "terra:max opus:xhigh luna:low:fast spare:6.": "luna (low, fast); round limit 30",
         "luna:fast:medium claude:low": "Reviewers luna (medium, fast), opus (low); round limit 26",
         "terra fable:high sonnet haiku:low": "Reviewers terra (max, standard), fable (high), sonnet (xhigh), "
                                              "haiku (low); round limit 26",
@@ -722,12 +732,14 @@ def main():
     for spec, want in cases.items():
         code, out = mmr("options", spec)
         check(code == 0 and want in out, f"options parse: {spec!r}")
-    for spec in ("terra:maxx", "opus:fast", "fable:fast", "opus claude", "terra terra", "rounds:0", "rounds:27", "rounds", "venus",
+    for spec in ("terra:maxx", "opus:fast", "fable:fast", "opus claude", "terra terra", "rounds:12", "code:19", "code:51", "code", "spare:1", "spare:7", "venus",
                  "terra:max:high", "terra:fast:fast", "terra:", "pick terra"):
         code, out = mmr("options", spec)
         check(code == 1 and "Init:" not in out, f"options refused: {spec!r}")
     code, out = mmr("options", "terra:fast opus")
-    check('Init: --spec "terra:max:fast opus:xhigh rounds:26"' in out, "options print the init spec")
+    check('Init: --spec "terra:max:fast opus:xhigh code:20 spare:2"' in out, "options print the init spec")
+    code, out = mmr("options", "rounds:12")
+    check(code == 1 and "code:<20-50>" in out, "rounds: points to code: and spare:")
     mmr("stop", "--reason", "Next scenario.")
     code, out = mmr("init", "--base", "main", "--intent-file", str(intent), "--new", "--spec", "astra:high sol:fast")
     check(code == 0 and "Reviewers astra (high, standard), sol (max, fast); round limit 26" in out, "init takes --spec")
@@ -741,9 +753,12 @@ def main():
     # Several Claude reviewers, each its own Agent model.
     mmr("stop", "--reason", "Next scenario.")
     code, out = mmr("init", "--base", "main", "--intent-file", str(intent), "--new",
-                    "--spec", "opus:high fable sonnet:low rounds:2")
-    check(code == 0 and "Reviewers opus (high), fable (xhigh), sonnet (low); round limit 2" in out,
+                    "--spec", "opus:high fable sonnet:low code:35 spare:4")
+    check(code == 0 and "Reviewers opus (high), fable (xhigh), sonnet (low); round limit 43" in out,
           "Claude-only panel saved")
+    state = json.loads((run_dir() / "run.json").read_text())
+    check(state["caps"] == {"code": 35, "docs": 2, "final": 2} and state["max_rounds"] == 43,
+          "the run stores its Code cap and limit")
     code, out = mmr("next", "--phase", "code")
     check(code == 0 and "Claude Agent opus: model opus, effort high" in out
           and "Claude Agent fable: model fable, effort xhigh" in out
