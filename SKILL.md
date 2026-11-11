@@ -13,7 +13,7 @@ Independent reviewers read the same prompt at the same commit. This session is t
 
 ## Settings
 
-- Round caps: Code 20 to 50 (default 20; the picker's Standard, Long and Max are 20, 35 and 50), Docs 2, Final 2, plus 2 to 6 spare rounds for evidence rounds (default 2). Hard stop: Their sum, 26 by default. Each phase ends at its first clean round, so the caps are ceilings. Older runs keep their own caps and limit.
+- Round caps: Code 20 to 50 (default 20; the picker's Standard, Long and Max are 20, 35 and 50), Docs 2, Final 2, plus 2 to 6 spare rounds for evidence rounds (default 2). Hard stop: Their sum, 26 by default. Each phase ends at its first clean round, so the caps are ceilings. Up to 4 Code rounds are full sweeps, and they count toward the Code cap. Older runs keep their own caps and limit.
 - Reviewers: Terra (gpt-6.1-terra) and Opus (Opus 5.5) by default. Optional: Fable (Fable 5.2), Astra (gpt-6-astra), Sol (gpt-6.1-sol), Sonnet (Sonnet 5.5), Haiku (Haiku 5.5) and Luna (gpt-6-luna). Runs started before this change call their Opus reviewer `claude`.
 - Effort is set for each reviewer, per run: low, medium, high, xhigh or max. Defaults: Codex max, Claude models xhigh.
 - Default panel: `terra:max:fast opus:xhigh code:20 spare:2`.
@@ -72,6 +72,7 @@ terra,opus	P1	src/a.py:42	accepted	Retry drops the last item	src/a.py: Keep the 
 terra	P1	src/b.py:9	rejected	Null token crashes	Token is non-null: src/auth.py:30 returns early
 ```
 
+- `loc` is `path:line` from the repo root. `close` dates each row with git blame on the lines around it: `before-branch`, `seen-in-full` (code a full Code sweep already reviewed) or `newer`. `mmr ages` shows these dates and changes nothing.
 - `status` is `accepted`, `rejected`, or `open`. `open` is only for the last allowed round, where a fix would go unreviewed.
 - `note` is what changed (accepted), the code-cited reason (rejected), or why it's left (open). Accepted and rejected notes feed the next prompt's fix list and ledger.
 - Reject out-of-phase findings as "Out of phase".
@@ -81,7 +82,7 @@ WIP commits: Message `WIP multimodel-review round <N>`, written to a file and pa
 
 ## Phases
 
-1. **Code:** Rounds 1-2 review the full diff vs the base. From round 3, only the delta plus the fix list. Reviewers may open any file for context. Outside the delta they report only P0, unless the delta causes the failure: Then the finding anchors to the delta line at its real severity.
+1. **Code:** Round 1 is a full sweep of the diff vs the base. After each fix, another full sweep runs, until a sweep finds no accepted P0/P1 on code an earlier sweep reviewed (dated `seen-in-full`), with at most 4 sweeps. Then delta rounds check the fixes: Only the delta plus the fix list. `close` prints which comes next and why. Reviewers may open any file for context. In a delta round, outside the delta they report only P0, unless the delta causes the failure: Then the finding anchors to the delta line at its real severity. Runs started before this change keep rounds 1-2 full and then delta rounds.
 2. **Cleanup (fixer only):** Runs before Docs so that any text written here gets a P2 review.
    - Docs: Update only docs made stale by this change. Trim, don't expand.
    - Tests: Delete only debugging or scaffolding tests and tests for removed code. Keep regression tests.

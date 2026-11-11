@@ -54,6 +54,12 @@ OLD_HARD_STOP = 18
 SLICE_OVER = int(os.environ.get("MMR_SLICE_OVER", str(60 * 1024)))
 SLICE_MAX = int(os.environ.get("MMR_SLICE_MAX", str(40 * 1024)))
 CROSS = "cross"
+# Code sweeps the full diff again after each fix until a sweep finds no accepted P0/P1 on code an
+# earlier sweep reviewed, at most this many times; then delta rounds check the fixes.
+# Runs saved without it keep rounds 1-2 full.
+FULL_SWEEPS = 4
+# How old a finding's code is, from git blame. Oldest first; "unknown" when blame can't place it.
+AGES = ["before-branch", "seen-in-full", "newer"]
 ALLOWED = {
     "code": {"P0", "P1"},
     "docs": {"P2"},
@@ -61,12 +67,13 @@ ALLOWED = {
     "evidence": {"P0", "P1", "P2"},
 }
 TRIAGE_HEADER = ["reviewers", "sev", "loc", "status", "summary", "note"]
-FINDING_COLS = ["id", "round", "phase", "reviewers", "sev", "loc", "status", "summary", "note"]
+FINDING_COLS = ["id", "round", "phase", "reviewers", "sev", "loc", "status", "summary", "note", "age"]
 ROUND_COLS = ["round", "phase", "phase_round", "scope", "commit", "fix_commit",
               "clean", "accepted", "rejected", "open", "tests"]
 # Reviewers are never held to a format. These only count findings, on a best-effort basis.
 SEVERITY_RE = re.compile(r"^\W*(?:\d+[.)]\W*)?(P[012])\b", re.I)
 LOCATION_RE = re.compile(r"[\w./()@+~-]+:\d+(?:-\d+)?")
+LOC_PARTS_RE = re.compile(r"([\w./()@+~-]+):(\d+)(?:-(\d+))?")
 CLEAN_RE = re.compile(r"\bno\s+(?:blocking\s+)?(?:issues|findings|problems)\b", re.I)
 SENSITIVE_RE = re.compile(
     r"^\.env(\.(?!example$|sample$|template$).*)?$|\.(pem|key|p8|p12|pfx|keystore|jks|mobileprovision)$"
@@ -627,7 +634,7 @@ def cmd_init(a):
         "reviewers": reviewers, "fast": fast, "effort": effort, "max_rounds": rounds, "caps": run_caps,
         "start_head": head, "started_at": now(), "rounds": 0,
         "created_branch": created, "snapshot_commit": snapshot, "left_out": left_out,
-        "slices": {"over": SLICE_OVER, "max": SLICE_MAX},
+        "slices": {"over": SLICE_OVER, "max": SLICE_MAX}, "full_sweeps": min(FULL_SWEEPS, run_caps["code"]),
         "phase_rounds": {"code": 0, "docs": 0, "final": 0, "evidence": 0},
         "phases": {"code": "pending", "docs": "pending", "final": "pending"},
         "open_round": None, "last_reviewed": None, "stopped": None, "finished": False,
@@ -645,7 +652,129 @@ def read_tsv(path):
     return [dict(zip(cols, ln.split("\t"))) for ln in lines[1:] if ln.strip()]
 
 
-def scope_text(phase, scope, sev_label):
+def write_tsv_rows(path, cols, rows):
+    """Append rows (dicts) in the file's column order. An older file gets the missing columns first,
+    so its old rows read as empty there."""
+    lines = Path(path).read_text().splitlines()
+    header = lines[0].split("\t") if lines else []
+    missing = [c for c in cols if c not in header]
+    if missing:
+        old = [ln for ln in lines[1:] if ln.strip()]
+        header += missing
+        tmp = Path(str(path) + ".tmp")
+        tmp.write_text("".join(ln + "\n" for ln in ["\t".join(header)] +
+                               [ln + "\t" * (len(header) - 1 - ln.count("\t")) for ln in old]))
+        os.replace(tmp, path)
+    with open(path, "a") as fh:
+        for row in rows:
+            fh.write("\t".join(str(row.get(c, "")) for c in header) + "\n")
+
+
+def git_history(repo):
+    """Where to read a run's history: its checkout, or the main repo once a worktree is gone."""
+    for path in dict.fromkeys((str(repo), str(repo).split("/.claude/worktrees/")[0])):
+        if Path(path).is_dir() and subprocess.run(
+                ["git", "-C", path, "rev-parse", "--git-dir"], capture_output=True,
+                timeout=30, stdin=subprocess.DEVNULL).returncode == 0:
+            return path
+    return None
+
+
+class Dater:
+    """How old a finding's code is: before-branch (an ancestor of the base), seen-in-full (an ancestor
+    of the last full Code sweep's commit, so a full sweep reviewed it) or newer. From
+    `git blame --porcelain -L n-1,n+1 <round commit> -- <path>`; the newest line in the window decides."""
+
+    def __init__(self, repo, base):
+        self.repo, self.base, self.ancestor, self.trees = git_history(repo), base, {}, {}
+
+    def git(self, *args):
+        try:
+            return subprocess.run(["git", "-C", self.repo, *args], capture_output=True, text=True,
+                                  timeout=60, stdin=subprocess.DEVNULL)
+        except subprocess.TimeoutExpired:
+            return None
+
+    def is_ancestor(self, sha, target):
+        if (sha, target) not in self.ancestor:
+            r = self.git("merge-base", "--is-ancestor", sha, target)
+            self.ancestor[(sha, target)] = bool(r) and r.returncode == 0
+        return self.ancestor[(sha, target)]
+
+    def path_at(self, commit, path):
+        """The path as the commit has it, also when a finding names only its end, like plan.rs."""
+        path = path.removeprefix("./").removeprefix(self.repo.rstrip("/") + "/")
+        r = self.git("cat-file", "-e", f"{commit}:{path}")
+        if r and r.returncode == 0:
+            return path
+        if commit not in self.trees:
+            r = self.git("ls-tree", "-r", "--name-only", "-z", commit)
+            self.trees[commit] = r.stdout.split("\0") if r and r.returncode == 0 else []
+        ends = [f for f in self.trees[commit] if f.endswith("/" + path)]
+        return ends[0] if len(ends) == 1 else None
+
+    def blame(self, commit, path, lo, hi):
+        r = self.git("blame", "--porcelain", "-L", f"{lo},{hi}", commit, "--", path)
+        short = r and r.returncode and re.search(r"has only (\d+) lines?", r.stderr)
+        if short:  # The window runs past the end of the file.
+            last = int(short.group(1))
+            r = self.git("blame", "--porcelain", "-L", f"{min(lo, last)},{last}", commit, "--", path) if last else None
+        if not r or r.returncode:
+            return []
+        return re.findall(r"^([0-9a-f]{40}) \d+ \d+", r.stdout, re.M)
+
+    def age(self, loc, commit, sweep):
+        m = LOC_PARTS_RE.search(loc or "")
+        path = self.repo and m and commit and self.path_at(commit, m.group(1))
+        if not path:
+            return "unknown"
+        first, last = sorted((int(m.group(2)), int(m.group(3) or m.group(2))))
+        shas = self.blame(commit, path, max(1, first - 1), min(last, first + 40) + 1)
+        if not shas:
+            return "unknown"
+        return AGES[max(0 if self.is_ancestor(sha, self.base) else
+                        1 if sweep and self.is_ancestor(sha, sweep) else 2 for sha in set(shas))]
+
+
+def sweeps_before(run, n=None):
+    """Closed full-scope Code rounds before round n. Docs and Final rounds don't count."""
+    return [r for r in read_tsv(run / "rounds.tsv")
+            if r["phase"] == "code" and r["scope"] == "full" and (n is None or int(r["round"]) < n)]
+
+
+def missed(run, n):
+    """Accepted P0/P1 of round n on code an earlier full sweep reviewed."""
+    return [f for f in read_tsv(run / "findings.tsv") if f["round"] == str(n) and f["status"] == "accepted"
+            and f["sev"] in ("P0", "P1") and f.get("age") == "seen-in-full"]
+
+
+def code_scope(run, s):
+    """Full or delta for the next Code round, and why. Runs saved before sweeps keep rounds 1-2 full."""
+    if s["phases"]["code"] == "reopened":
+        return "delta", ""
+    cap = s.get("full_sweeps")
+    if cap is None:
+        return ("full" if s["phase_rounds"]["code"] < 2 else "delta"), ""
+    code = [r for r in read_tsv(run / "rounds.tsv") if r["phase"] == "code"]
+    done = len(sweeps_before(run))
+    if not code:
+        return "full", "Full sweep 1"
+    if code[-1]["scope"] != "full":
+        return "delta", ""
+    if done >= cap:
+        return "delta", f"{done} full sweeps is the cap, so delta rounds check the fixes"
+    if done == 1:
+        return "full", "Full sweep 2, after sweep 1's fixes"
+    found = len(missed(run, code[-1]["round"]))
+    if found:
+        return "full", f"Full sweep {done + 1}: Sweep {done} found {found} accepted P0/P1 on code an earlier sweep reviewed"
+    return "delta", f"Sweep {done} found nothing new on code an earlier sweep reviewed, so delta rounds check the fixes"
+
+
+def scope_text(phase, scope, sev_label, sweep=0):
+    if scope == "full" and sweep > 1:
+        return (f"Review the full diff again: This is full sweep {sweep}. Earlier sweeps reviewed this code and "
+                f"still missed bugs, so read every change, not only the fixes. Report {sev_label} only.")
     if scope == "full":
         return f"Review the full diff. Report {sev_label} only."
     return (f"Review only the delta plus the fix list. Report {sev_label} only. You may open any file "
@@ -689,8 +818,9 @@ def cmd_next(a):
     head = git(top, "rev-parse", "HEAD")
     n = s["rounds"] + 1
     pr = s["phase_rounds"][phase] + 1
+    why = ""
     if phase == "code":
-        scope = "full" if pr <= 2 and phases["code"] != "reopened" else "delta"
+        scope, why = code_scope(run, s)
     elif phase in ("docs", "final"):
         scope = "full" if pr == 1 else "delta"
     else:
@@ -732,6 +862,9 @@ def cmd_next(a):
         ]
         return "\n".join(parts)
 
+    sweep = len(sweeps_before(run)) + 1 if phase == "code" and scope == "full" and s.get("full_sweeps") else 0
+    again = (f"This is full sweep {sweep}: Earlier sweeps reviewed this code and still missed bugs, so read "
+             "every change, not only the fixes. ") if sweep > 1 else ""
     split = s.get("slices")
     slices = plan_slices(diff, split["max"]) if scope == "full" and split and nbytes(diff) > split["over"] else []
     names = [f"s{i}" for i in range(1, len(slices) + 1)] if len(slices) > 1 else []
@@ -747,7 +880,7 @@ def cmd_next(a):
             files = slice_files(items)
             listing = "\n".join(f"- {p} ({kb(sum(nbytes(t) for q, t in items if q == p))} KB)" for p in files)
             (pd / "prompt.md").write_text(prompt(pd / "diff.patch", (
-                f"Review the full diff of the files in this slice. The round's diff is {size} KB, so it is split "
+                f"{again}Review the full diff of the files in this slice. The round's diff is {size} KB, so it is split "
                 f"by folder into {len(names)} slices, each with its own pass, plus a cross-file pass. Focus on "
                 "these files, and report a problem elsewhere only if this slice's code causes it. You may open "
                 f"any file for context. Report {sev_label} only.\n\nFiles in this slice:\n{listing}"),
@@ -773,7 +906,9 @@ def cmd_next(a):
             *[f"- {name}: {rd / name / 'prompt.md'}" for name in names + [CROSS]], ""]))
         meta["parts"] = names + [CROSS]
     else:
-        (rd / "prompt.md").write_text(prompt(rd / "diff.patch", scope_text(phase, scope, sev_label)))
+        (rd / "prompt.md").write_text(prompt(rd / "diff.patch", scope_text(phase, scope, sev_label, sweep)))
+    if sweep:
+        meta["sweep"] = sweep
     write_json(rd / "round.json", meta)
     s["rounds"] = n
     s["phase_rounds"][phase] = pr
@@ -781,7 +916,8 @@ def cmd_next(a):
     if phase in phases and phases[phase] == "pending":
         phases[phase] = "open"
     save(run, s)
-    print(f"Round {n}: {phase} phase round {pr}, {scope} range {start[:12]}..{head[:12]}")
+    print(f"Round {n}: {phase} phase round {pr}, {scope} range {start[:12]}..{head[:12]}"
+          + (f". {why}." if why else ""))
     if names:
         print(f"Split: The {kb(nbytes(diff))} KB diff is {len(names)} slices of at most {kb(split['max'])} KB, "
               "plus a cross-file pass. Every reviewer reviews every slice and the cross-file pass, in parallel.")
@@ -1027,8 +1163,6 @@ def cmd_barrier(a):
     sys.exit(1)
 
 
-LOC_PARTS_RE = re.compile(r"([\w./()@+~-]+):(\d+)(?:-(\d+))?")
-
 
 def write_answers(rd, reviewers):
     """One file with every slice's answers, so triage can merge findings across slices."""
@@ -1142,11 +1276,14 @@ def cmd_close(a):
             die("Accepted findings need --tests with the passing test command, or 'none: docs only'.")
     elif head != meta["commit"]:
         die("HEAD moved, but no finding was accepted.")
-    with open(run / "findings.tsv", "a") as fh:
-        for i, row in enumerate(rows, 1):
-            values = [f"R{n}-{i}", str(n), phase, ",".join(row["reviewers"]), row["sev"],
-                      row["loc"], row["status"], row["summary"], row["note"]]
-            fh.write("\t".join(values) + "\n")
+    sweeps = sweeps_before(run, n)
+    dater = Dater(s["repo"], s["base_commit"])
+    for row in rows:
+        row["age"] = dater.age(row["loc"], meta["commit"], sweeps[-1]["commit"] if sweeps else None)
+    write_tsv_rows(run / "findings.tsv", FINDING_COLS, [
+        {"id": f"R{n}-{i}", "round": n, "phase": phase, "reviewers": ",".join(row["reviewers"]),
+         **{k: row[k] for k in ("sev", "loc", "status", "summary", "note", "age")}}
+        for i, row in enumerate(rows, 1)])
     clean = not accepted and not held
     with open(run / "rounds.tsv", "a") as fh:
         values = [n, phase, meta["phase_round"], meta["scope"], meta["commit"], head,
@@ -1165,6 +1302,9 @@ def cmd_close(a):
                 message = f"Code converged. Next: Cleanup, then write {run / 'cleanup.md'}"
         elif held:
             s["stopped"] = "Code cap reached with open findings."
+        elif s.get("full_sweeps"):
+            _, why = code_scope(run, s)
+            message = (f"{why}. " if why else "") + message
     elif phase == "docs":
         if clean or last:
             phases["docs"] = "converged" if clean else "ended"
@@ -1187,8 +1327,11 @@ def cmd_close(a):
     if s["stopped"]:
         message = f"STOP: {s['stopped']} Next: Done steps."
     save(run, s)
+    ages = [row["age"] for row in rows]
+    dated = ", ".join(f"{ages.count(age)} {age}" for age in AGES + ["unknown"] if age in ages)
     print(f"Round {n} closed: {'clean' if clean else 'not clean'}; "
-          f"{len(accepted)} accepted, {len(rejected)} rejected, {len(held)} open.\n{message}")
+          f"{len(accepted)} accepted, {len(rejected)} rejected, {len(held)} open."
+          + (f" Code dated by git blame: {dated}." if dated else "") + f"\n{message}")
 
 
 def cmd_status(a):
@@ -1283,6 +1426,15 @@ def reviewer_stats(run, s):
     return stats, findings
 
 
+def sweep_lines(run, s):
+    sweeps = sweeps_before(run)
+    if not s.get("full_sweeps") or not sweeps:
+        return []
+    found = [f"round {r['round']}: {len(missed(run, r['round']))}" for r in sweeps[1:]]
+    return [f"Full Code sweeps: {len(sweeps)} (rounds {', '.join(r['round'] for r in sweeps)}"
+            + (f"). Accepted P0/P1 on code an earlier sweep reviewed: {', '.join(found)}" if found else ")")]
+
+
 def cmd_report(a):
     run, s = load(a.repo)
     stats, findings = reviewer_stats(run, s)
@@ -1291,6 +1443,7 @@ def cmd_report(a):
            f"Docs {s['phase_rounds']['docs']}, Final {s['phase_rounds']['final']}, "
            f"Evidence {s['phase_rounds']['evidence']}",
            f"Result: {s['stopped'] or 'Converged'}",
+           *sweep_lines(run, s),
            settings_line(s),
            f"Branch: {s['branch']}" + (" (created for this run)" if s.get("created_branch") else ""),
            f"Uncommitted work: {'Saved as WIP snapshot ' + s['snapshot_commit'][:12] if s.get('snapshot_commit') else 'None'}",
@@ -1340,6 +1493,64 @@ def cmd_archive(a):
     save(run, s)
     print(f"Archived {len(ids) - failed} of {len(ids)} Codex chats.")
     sys.exit(1 if failed else 0)
+
+
+def cmd_ages(a):
+    """Date findings with git blame. Reads only, and writes nothing: With --run, every finding of that
+    run folder; otherwise the current run's open round (its triage.tsv, or else the reviewers' answers)
+    or, with no open round, all its findings."""
+    if a.run:
+        run = Path(a.run).expanduser().resolve()
+        s = read_json(run / "run.json")
+    else:
+        run, s = load(a.repo)
+    dater = Dater(a.git or s["repo"], s["base_commit"])
+    if not dater.repo:
+        die(f"No git history at {a.git or s['repo']} or its main repo.")
+    print(f"Run: {run}\nHistory: {dater.repo}")
+    sweeps = sweeps_before(run)
+    print("Full Code sweeps: " + (", ".join(f"round {r['round']} at {r['commit'][:12]}" for r in sweeps) or "None"))
+
+    def last_sweep(n):
+        before = [r for r in sweeps if int(r["round"]) < int(n)]
+        return before[-1]["commit"] if before else None
+
+    n = s.get("open_round")
+    if n and not a.run:
+        rd = round_dir(run, n)
+        meta = read_json(rd / "round.json")
+        print(f"Open round {n} ({meta['phase']}), dated at {meta['commit'][:12]}:")
+        if (rd / "triage.tsv").exists():
+            for row in read_tsv(rd / "triage.tsv"):
+                age = dater.age(row.get("loc", ""), meta["commit"], last_sweep(n))
+                print(f"{row.get('sev')}\t{row.get('status')}\t{age}\t{row.get('loc')}\t{row.get('summary')}")
+        else:
+            for pd in part_dirs(rd):
+                for who in panel(s):
+                    final = pd / f"{who}.final.md"
+                    for sev, loc in parse_final(final.read_text())[1] if final.exists() else []:
+                        print(f"{label(who, pd)}\t{sev}\t{dater.age(loc, meta['commit'], last_sweep(n))}\t{loc}")
+        return
+    rounds = {r["round"]: r for r in read_tsv(run / "rounds.tsv")}
+    by_round = {}
+    print("id\tround\tphase\tsev\tstatus\tage\treviewers\tloc")
+    for f in read_tsv(run / "findings.tsv"):
+        if f["round"] not in rounds:
+            continue
+        age = dater.age(f["loc"], rounds[f["round"]]["commit"], last_sweep(f["round"]))
+        stored = f.get("age")
+        print("\t".join([f["id"], f["round"], f["phase"], f["sev"], f["status"], age, f["reviewers"], f["loc"]])
+              + (f"\t(stored: {stored})" if stored and stored != age else ""))
+        by_round.setdefault(f["round"], []).append((f, age))
+    print("\nBy round:")
+    for rn, items in by_round.items():
+        r = rounds[rn]
+        ages = [age for _, age in items]
+        line = ", ".join(f"{ages.count(x)} {x}" for x in AGES + ["unknown"] if x in ages)
+        who = [f"{w} {sum(w in f['reviewers'].split(',') for f, _ in items)} "
+               f"({sum(w in f['reviewers'].split(',') and age == 'seen-in-full' for f, age in items)} seen-in-full)"
+               for w in panel(s) if any(w in f["reviewers"].split(",") for f, _ in items)]
+        print(f"Round {rn} {r['phase']} ({r['scope']}): {line}. By reviewer: {', '.join(who)}.")
 
 
 def cmd_slices(a):
@@ -1405,6 +1616,10 @@ def main():
     c.add_argument("--reviewer", required=True, choices=ALL_REVIEWERS + ["claude"])
     c.add_argument("--slice", help=slice_help)
     c.set_defaults(fn=cmd_reread)
+    c = sub.add_parser("ages", help="Date findings with git blame; writes nothing")
+    c.add_argument("--run", help="A run folder to read instead of this repo's current run")
+    c.add_argument("--git", help="Read history from this repo instead of the run's checkout")
+    c.set_defaults(fn=cmd_ages)
     c = sub.add_parser("slices", help="Show how a diff file would be split; starts nothing")
     c.add_argument("--diff", required=True)
     c.add_argument("--over", type=int, default=SLICE_OVER)

@@ -18,6 +18,7 @@ It needs Python 3, git and the Codex CLI.
 - Reviewers: Codex terra, astra, sol and luna, and Claude opus, fable, sonnet and haiku. Fast mode is for the Codex models only.
 - `code:<20-50>` caps the Code phase (default 20), and `spare:<2-6>` adds rounds for re-checks after a device test (default 2). Docs and Final get 2 rounds each. Each phase ends at its first clean round.
 - `/multimodel-review pick` opens a picker.
+- Code sweeps the full diff again after each fix, until a sweep finds no new bug on code an earlier sweep reviewed (at most 4 sweeps). Then delta rounds check the fixes. Each finding is dated with git blame.
 - A full-scope round whose diff is over 60 KB is split by folder into slices of at most 40 KB. Each slice gets its own pass, all in parallel, plus a cross-file pass.
 
 ## Test

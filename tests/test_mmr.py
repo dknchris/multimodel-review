@@ -423,6 +423,154 @@ def slice_tests(tmp, env, intent):
     check(code == 0 and "Split" not in out and "Prompt:" in out, "older runs never split")
 
 
+def sweep_tests(tmp, env, intent):
+    """Code sweeps the full diff again while sweeps find accepted bugs on code an earlier sweep reviewed.
+    git blame dates each finding: before-branch, seen-in-full, newer or unknown."""
+    repo = tmp / "sweeps"
+    (repo / "src" / "deep").mkdir(parents=True)
+    f = repo / "src" / "deep" / "f.txt"
+    modes = Path(env["FAKE_MODE_FILE"])
+
+    def g(*args):
+        return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t.t", *args], cwd=repo,
+                              capture_output=True, text=True).stdout.strip()
+
+    def mmr(*args):
+        r = subprocess.run([sys.executable, MMR, "--repo", str(repo), *args], capture_output=True,
+                           text=True, env={**env, **GIT_ID}, timeout=90)
+        return r.returncode, r.stdout + r.stderr
+
+    def edit(changes, msg):
+        lines = f.read_text().splitlines()
+        for i, text in changes.items():
+            lines[i - 1] = text
+        f.write_text("\n".join(lines) + "\n")
+        g("commit", "-qam", msg)
+
+    def review(n, rows):
+        modes.write_text("finding")
+        mmr("codex", "--reviewer", "terra")
+        rd = latest_run(repo, env) / "rounds" / f"{n:02d}"
+        (rd / "opus.answer.md").write_text("NO BLOCKING ISSUES.")
+        mmr("claude-result", "--seconds", "1")
+        (rd / "triage.tsv").write_text(HEADER + "".join(f"terra\t{r}\n" for r in rows))
+
+    f.write_text("".join(f"base {i}\n" for i in range(1, 11)))
+    g("init", "-q", "-b", "main")
+    g("add", "-A")
+    g("commit", "-qm", "base")
+    g("checkout", "-qb", "feature")
+    edit({i: f"c1 {i}" for i in range(3, 11)}, "c1")
+    check(mmr("init", "--base", "main", "--intent-file", str(intent))[0] == 0, "sweep run starts")
+    run = latest_run(repo, env)
+    check(json.loads((run / "run.json").read_text())["full_sweeps"] == 4, "new runs store the sweep cap")
+
+    code, out = mmr("next", "--phase", "code")
+    check(code == 0 and "full" in out and "Full sweep 1" in out, "round 1 is sweep 1")
+    review(1, ["P1\tsrc/deep/f.txt:5\taccepted\tBug one\tf.txt: Fix 9"])
+    edit({9: "c2 9"}, "WIP round 1")
+    code, out = mmr("close", "--tests", "make test")
+    check(code == 0 and "Full sweep 2" in out and "1 newer" in out, "sweep 1's fixes lead to sweep 2")
+
+    code, out = mmr("next", "--phase", "code")
+    check(code == 0 and "full range" in out, "round 2 is full")
+    check("This is full sweep 2" in (run / "rounds" / "02" / "prompt.md").read_text(), "sweep 2 says so")
+    review(2, ["P1\tsrc/deep/f.txt:5\taccepted\tMissed by sweep 1\tf.txt: Fix 7"])
+    edit({7: "c3 7"}, "WIP round 2")
+    code, out = mmr("close", "--tests", "make test")
+    check(code == 0 and "Full sweep 3: Sweep 2 found 1 accepted P0/P1 on code an earlier sweep reviewed" in out,
+          "a sweep that finds bugs on reviewed code leads to another sweep")
+
+    check(mmr("next", "--phase", "code")[0] == 0, "round 3 opens")
+    check(json.loads((run / "rounds" / "03" / "round.json").read_text())["scope"] == "full", "round 3 is full")
+    review(3, ["P1\tsrc/deep/f.txt:8\taccepted\tOnly in new code\tf.txt: Fix 8",
+               "P1\tsrc/deep/f.txt:1\trejected\tOld line\tPre-existing: f.txt:1",
+               "P1\tf.txt:5\trejected\tShort path\tGuarded: f.txt:5",
+               "P1\tnope.txt:3\trejected\tNo such file\tNo such file"])
+    edit({8: "c4 8"}, "WIP round 3")
+    code, out = mmr("close", "--tests", "make test")
+    check(code == 0 and "Sweep 3 found nothing new on code an earlier sweep reviewed, so delta rounds" in out,
+          "a sweep with bugs only in fix code goes back to delta rounds")
+    ages = {r["id"]: r["age"] for r in mmr_tsv(run / "findings.tsv")}
+    check(ages == {"R1-1": "newer", "R2-1": "seen-in-full", "R3-1": "newer", "R3-2": "before-branch",
+                   "R3-3": "seen-in-full", "R3-4": "unknown"}, f"findings are dated: {ages}")
+    code, out = mmr("next", "--phase", "code")
+    check(code == 0 and "delta range" in out, "round 4 is a delta")
+    review(4, ["P1\tsrc/deep/f.txt:8\trejected\tFine\tGuarded: f.txt:8"])
+    check(mmr("close")[0] == 0, "code converges")
+    code, out = mmr("ages")
+    check(code == 0 and "Round 2 code (full): 1 seen-in-full" in out and "R3-4" in out, "ages dates a finished run")
+    report = mmr("report")[1]
+    check("Full Code sweeps: 3 (rounds 1, 2, 3). Accepted P0/P1 on code an earlier sweep reviewed: "
+          "round 2: 1, round 3: 0" in report, "report shows the sweeps")
+
+    # The sweep cap, runs saved before sweeps, and the main repo once a worktree is gone.
+    mod = load_module()
+    s = json.loads((run / "run.json").read_text())
+    s["phases"]["code"] = "open"
+    rows = (run / "rounds.tsv").read_text().splitlines()
+    (run / "rounds.tsv").write_text("\n".join(rows[:3]) + "\n")  # As if round 2 just closed.
+    check(mod.code_scope(run, s)[0] == "full", "sweep 2's bug on reviewed code asks for sweep 3")
+    check(mod.code_scope(run, {**s, "full_sweeps": 2}) == ("delta", "2 full sweeps is the cap, so delta rounds "
+                                                           "check the fixes"), "the sweep cap goes back to delta")
+    old = {k: v for k, v in s.items() if k != "full_sweeps"}
+    check([mod.code_scope(run, {**old, "phase_rounds": {**old["phase_rounds"], "code": c}})[0] for c in (0, 1, 2, 5)]
+          == ["full", "full", "delta", "delta"], "runs saved before sweeps keep rounds 1-2 full")
+    gone = repo / ".claude" / "worktrees" / "gone"
+    check(mod.Dater(str(gone), s["base_commit"]).repo == str(repo), "a missing worktree reads the main repo")
+
+
+def legacy_findings_tests(tmp, env, intent):
+    """A findings.tsv saved before the age column gains it at the next close; old rows read as undated."""
+    repo = tmp / "legacy"
+    repo.mkdir()
+
+    def g(*args):
+        subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t.t", *args], cwd=repo, capture_output=True)
+
+    def mmr(*args):
+        r = subprocess.run([sys.executable, MMR, "--repo", str(repo), *args], capture_output=True,
+                           text=True, env={**env, **GIT_ID}, timeout=90)
+        return r.returncode, r.stdout + r.stderr
+
+    (repo / "a.txt").write_text("one\n")
+    g("init", "-q", "-b", "main")
+    g("add", "-A")
+    g("commit", "-qm", "one")
+    g("checkout", "-qb", "feature")
+    (repo / "a.txt").write_text("two\n")
+    g("commit", "-qam", "two")
+    check(mmr("init", "--base", "main", "--intent-file", str(intent))[0] == 0, "legacy run starts")
+    run = latest_run(repo, env)
+    old_cols = ["id", "round", "phase", "reviewers", "sev", "loc", "status", "summary", "note"]
+    (run / "findings.tsv").write_text("\t".join(old_cols) + "\n" + "R0-1\t0\tcode\tterra\tP1\ta.txt:1\trejected\tOld\tOld\n")
+    state = json.loads((run / "run.json").read_text())
+    for key in ("slices", "full_sweeps", "caps", "max_rounds"):
+        state.pop(key, None)
+    (run / "run.json").write_text(json.dumps(state))
+    check(mmr("next", "--phase", "code")[0] == 0, "legacy run opens a round")
+    Path(env["FAKE_MODE_FILE"]).write_text("finding")
+    mmr("codex", "--reviewer", "terra")
+    (run / "rounds" / "01" / "opus.answer.md").write_text("NO BLOCKING ISSUES.")
+    mmr("claude-result", "--seconds", "1")
+    (run / "rounds" / "01" / "triage.tsv").write_text(HEADER + "terra\tP1\ta.txt:1\taccepted\tNew\ta.txt: Three\n")
+    (repo / "a.txt").write_text("three\n")
+    g("commit", "-qam", "WIP round 1")
+    code, out = mmr("close", "--tests", "make test")
+    check(code == 0 and "sweep" not in out, "legacy run closes without sweeps")
+    rows = mmr_tsv(run / "findings.tsv")
+    check(len(rows) == 2 and rows[0]["age"] == "" and rows[1]["age"] == "newer", "old rows stay, new rows are dated")
+    check(mmr("report")[0] == 0 and mmr("status")[0] == 0, "legacy run still reports")
+    code, out = mmr("next", "--phase", "code")
+    check(code == 0 and "full range" in out and "sweep" not in out, "legacy round 2 is full, with no sweep")
+
+
+def mmr_tsv(path):
+    lines = Path(path).read_text().splitlines()
+    cols = lines[0].split("\t")
+    return [dict(zip(cols, ln.split("\t"))) for ln in lines[1:] if ln.strip()]
+
+
 def picker_tests(tmp):
     """mmr picker: a small CDN loader only for a pushed, unchanged picker.js on GitHub; inline otherwise."""
     import base64
@@ -551,6 +699,8 @@ def main():
     start_gate_tests(tmp, env, intent)
     location_tests(tmp, env, intent)
     slice_tests(tmp, env, intent)
+    sweep_tests(tmp, env, intent)
+    legacy_findings_tests(tmp, env, intent)
 
     sh("git", "init", "-q", "-b", "main")
     commit("one\n", "one")
