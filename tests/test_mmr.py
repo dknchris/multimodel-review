@@ -260,6 +260,169 @@ def start_gate_tests(tmp, env, intent):
     check(code == 0 and "detached HEAD" in out, "detached HEAD branches first")
 
 
+def load_module():
+    sys.dont_write_bytecode = True
+    spec = importlib.util.spec_from_file_location("mmr", MMR)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def fake_diff(files):
+    """A git-style diff: {path: [hunk sizes in lines]}, 40-byte lines."""
+    out = []
+    for path, hunks in files.items():
+        out += [f"diff --git a/{path} b/{path}", "index 1111111..2222222 100644", f"--- a/{path}", f"+++ b/{path}"]
+        for i, lines in enumerate(hunks):
+            out.append(f"@@ -{i * 100 + 1},{lines} +{i * 100 + 1},{lines} @@ def f{i}():")
+            out += [f"+{path[:20]:<20} hunk {i:02d} line {j:04d}"[:39] for j in range(lines)]
+    return "\n".join(out) + "\n"
+
+
+def slice_unit_tests():
+    """plan_slices: by folder, at most the limit, nothing lost, big files cut between hunks."""
+    mmr = load_module()
+    files = {"apps/web/a.ts": [10], "apps/web/b.ts": [10], "apps/cli/c.ts": [12],
+             "crates/core/src/plan.rs": [30, 30, 30, 30], "crates/core/src/run.rs": [8],
+             "crates/adb/x.rs": [5], "docs/guide.md": [4], "README.md": [2]}
+    diff = fake_diff(files)
+    limit = 2000
+    slices = mmr.plan_slices(diff, limit)
+    check(len(slices) > 2 and all(mmr.nbytes("".join(t for _, t in s)) <= limit for s in slices),
+          "every slice is at most the limit")
+    lines = lambda text: sorted(ln for ln in text.splitlines() if ln.startswith(("+", "@@")) and not ln.startswith("+++"))
+    check(lines("".join(t for s in slices for _, t in s)) == lines(diff), "slices keep every hunk line once")
+    order = [mmr.slice_files(s) for s in slices]
+    flat = [p for files_ in order for p in files_]
+    check(set(flat) == set(files), "every file is in a slice")
+    plan_pieces = [t for s in slices for p, t in s if p == "crates/core/src/plan.rs"]
+    check(len(plan_pieces) > 1 and all(t.startswith("diff --git a/crates/core/src/plan.rs") and "\n@@ " in t
+                                       for t in plan_pieces), "a big file is cut between hunks, header kept")
+    where = {}
+    for i, files_ in enumerate(order):
+        for p in files_:
+            where.setdefault(p.rsplit("/", 1)[0] if "/" in p else "", set()).add(i)
+    check(all(max(v) - min(v) <= len(v) - 1 for v in where.values()), "a folder's files sit in neighbouring slices")
+    names = [f"s{i}" for i in range(1, len(slices) + 1)]
+    outline = mmr.slice_outline(names, slices)
+    check(all(p in outline for p in files) and "@@ -301,30 +301,30 @@ def f3():" in outline
+          and "+10 -0" in outline and "+" * 3 not in outline, "the cross outline lists files and hunk headers only")
+    check(mmr.plan_slices(fake_diff({"one.txt": [3]}), limit) == [[("one.txt", fake_diff({"one.txt": [3]}))]],
+          "a small diff is one slice")
+    quoted = 'diff --git "a/my file.txt" "b/my file.txt"\n@@ -1 +1 @@\n+x\n'
+    check(mmr.diff_files(quoted)[0][0] == "my file.txt", "quoted paths parse")
+
+
+def slice_tests(tmp, env, intent):
+    """A full-scope round over the size limit runs one pass per slice plus a cross-file pass."""
+    repo = tmp / "sliced"
+    (repo / "src" / "app").mkdir(parents=True)
+    (repo / "src" / "lib").mkdir()
+    (repo / "docs").mkdir()
+    modes = Path(env["FAKE_MODE_FILE"])
+    small = {**env, "MMR_SLICE_OVER": "2000", "MMR_SLICE_MAX": "1500"}
+
+    def g(*args):
+        return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t.t", *args], cwd=repo,
+                              capture_output=True, text=True).stdout.strip()
+
+    def mmr(*args, e=None):
+        r = subprocess.run([sys.executable, MMR, "--repo", str(repo), *args], capture_output=True,
+                           text=True, env={**(e or env), **GIT_ID}, timeout=90)
+        return r.returncode, r.stdout + r.stderr
+
+    paths = ["src/app/one.py", "src/app/two.py", "src/lib/three.py", "docs/guide.md", "a.txt"]
+    for p in paths:
+        (repo / p).write_text("start\n")
+    g("init", "-q", "-b", "main")
+    g("add", "-A")
+    g("commit", "-qm", "base")
+    g("checkout", "-qb", "feature")
+    for p in paths:
+        (repo / p).write_text("".join(f"{p} changed line {i}\n" for i in range(30)))
+    g("commit", "-qam", "change")
+    code, out = mmr("init", "--base", "main", "--intent-file", str(intent), e=small)
+    check(code == 0, "split run starts")
+    run = latest_run(repo, env)
+    check(json.loads((run / "run.json").read_text())["slices"] == {"over": 2000, "max": 1500},
+          "the run keeps its split sizes")
+    code, out = mmr("next", "--phase", "code")
+    rd = run / "rounds" / "01"
+    parts = json.loads((rd / "round.json").read_text()).get("parts", [])
+    check(code == 0 and "Split:" in out and len(parts) >= 3 and parts[-1] == "cross", "big full round is split")
+    check(all((rd / p / "prompt.md").exists() and (rd / p / "diff.patch").exists() for p in parts),
+          "each slice has its own prompt and diff")
+    s1 = (rd / "s1" / "prompt.md").read_text()
+    check(f"Diff file: {rd / 's1' / 'diff.patch'}" in s1 and "Slice: s1 of" in s1 and "Files in this slice" in s1,
+          "a slice prompt names its own diff and files")
+    cross = (rd / "cross" / "prompt.md").read_text()
+    check("Cross-file pass" in cross and str(rd / "diff.patch") in cross
+          and "@@" in (rd / "cross" / "diff.patch").read_text()
+          and "+src/app" not in (rd / "cross" / "diff.patch").read_text(), "the cross pass gets hunk headers only")
+    check(all(f"Claude Agent opus {p}: model opus" in out for p in parts) and "Codex terra:" in out,
+          "next lists a Claude Agent per slice")
+    modes.write_text("finding")
+    code, out = mmr("codex", "--reviewer", "terra", "--slice", "s1")
+    check(code == 0 and "terra s1 attempt 1: ok; 1 finding" in out, "one slice runs alone")
+    modes.write_text("")
+    code, out = mmr("codex", "--reviewer", "terra")
+    check(code == 0 and f"{len(parts) - 1} of {len(parts) - 1} slice passes ok" in out, "the rest run at once")
+    code, out = mmr("codex", "--reviewer", "terra")
+    check(code == 1 and "--slice" in out, "a second fan-out is refused")
+    code, out = mmr("monitor", "--reviewer", "terra")
+    check(code == 0 and all(f"FINISHED terra {p}: ok" in out for p in parts), "one monitor covers every slice")
+    code, out = mmr("codex", "--reviewer", "terra", "--slice", "s9")
+    check(code == 1 and "No slice s9" in out, "unknown slice refused")
+    for p in parts:
+        answer = "[P1] a.txt:1 | x -> y | Fix." if p == "s1" else "NO BLOCKING ISSUES."
+        (rd / p / "opus.answer.md").write_text(answer)
+    code, out = mmr("claude-result", "--seconds", "30")
+    check(code == 1 and "--slice" in out, "a split round's Claude result names its slice")
+    check(mmr("barrier")[0] == 1, "barrier waits for every slice")
+    for p in parts:
+        check(mmr("claude-result", "--slice", p, "--seconds", "30")[0] == 0, f"opus {p} saved")
+    code, out = mmr("barrier")
+    check(code == 0 and "terra s1: ok" in out and "opus cross: ok" in out and "answers.md" in out,
+          "barrier passes on every slice")
+    answers = (rd / "answers.md").read_text()
+    check("a.txt:1: terra s1 P1, opus s1 P1" in answers and "## cross" in answers, "answers group likely duplicates")
+    code, out = mmr("status")
+    check("split into s1" in out and "opus s2: ok" in out, "status lists each slice")
+    (rd / "triage.tsv").write_text(HEADER + "terra\tP1\ta.txt:1\trejected\tNot real\tGuarded: a.txt:1\n"
+                                   + "opus\tP1\ta.txt:1\trejected\tNot real.\tGuarded: a.txt:1\n")
+    check(mmr("close")[0] == 0, "split round closes")
+    rows = [ln.split("\t") for ln in (run / "findings.tsv").read_text().splitlines()[1:]]
+    check(len(rows) == 1 and rows[0][3] == "terra,opus", "duplicate rows merge into one finding")
+    report = mmr("report")[1]
+    check("| terra | 1 |" in report and "| opus | 1 |" in report, "report counts findings across slices")
+
+    # A failed slice: the monitor reports it and the rest, and only that slice reruns.
+    mmr("stop", "--reason", "Next scenario.")
+    check(mmr("init", "--base", "main", "--intent-file", str(intent), "--new", e=small)[0] == 0, "failing split run")
+    check(mmr("next", "--phase", "code")[0] == 0, "failing split round")
+    modes.write_text("crash")
+    check(mmr("codex", "--reviewer", "terra", "--slice", "s1")[0] == 1, "s1 crashes")
+    modes.write_text("")
+    check(mmr("codex", "--reviewer", "terra")[0] == 0, "the other slices still run")
+    code, out = mmr("monitor", "--reviewer", "terra")
+    check(code == 1 and "FAILED terra s1: crash" in out and "FINISHED terra s2: ok" in out,
+          "the monitor reports the failed slice and the finished ones")
+    code, out = mmr("barrier")
+    check(code == 1 and "terra s1: crash" in out, "barrier names the failed slice")
+    code, out = mmr("codex", "--reviewer", "terra", "--slice", "s1")
+    check(code == 0 and "terra s1 attempt 2: ok" in out, "only the failed slice reruns")
+
+    # A run saved before slices never splits.
+    mmr("stop", "--reason", "Next scenario.")
+    check(mmr("init", "--base", "main", "--intent-file", str(intent), "--new", e=small)[0] == 0, "second split run")
+    run = latest_run(repo, env)
+    state = json.loads((run / "run.json").read_text())
+    state.pop("slices")
+    (run / "run.json").write_text(json.dumps(state))
+    code, out = mmr("next", "--phase", "code", e=small)
+    check(code == 0 and "Split" not in out and "Prompt:" in out, "older runs never split")
+
+
 def picker_tests(tmp):
     """mmr picker: a small CDN loader only for a pushed, unchanged picker.js on GitHub; inline otherwise."""
     import base64
@@ -384,8 +547,10 @@ def main():
     intent = tmp / "intent.md"
     intent.write_text("Make a.txt say two.\n")
     parser_tests()
+    slice_unit_tests()
     start_gate_tests(tmp, env, intent)
     location_tests(tmp, env, intent)
+    slice_tests(tmp, env, intent)
 
     sh("git", "init", "-q", "-b", "main")
     commit("one\n", "one")

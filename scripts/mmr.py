@@ -49,6 +49,11 @@ SPARE_RANGE = (2, 6)  # A run's spare rounds, set with spare:<n>.
 MAX_LIMIT = CODE_RANGE[1] + CAPS["docs"] + CAPS["final"] + SPARE_RANGE[1]
 OLD_CAPS = {"code": 12, "docs": 2, "final": 2}  # Runs saved before the caps were stored keep these.
 OLD_HARD_STOP = 18
+# A full-scope diff over SLICE_OVER bytes is split by folder into slices of at most SLICE_MAX bytes,
+# each with its own reviewer pass, plus one cross-file pass. Runs saved without these never split.
+SLICE_OVER = int(os.environ.get("MMR_SLICE_OVER", str(60 * 1024)))
+SLICE_MAX = int(os.environ.get("MMR_SLICE_MAX", str(40 * 1024)))
+CROSS = "cross"
 ALLOWED = {
     "code": {"P0", "P1"},
     "docs": {"P2"},
@@ -178,6 +183,137 @@ def round_dir(run, n):
     return run / "rounds" / f"{n:02d}"
 
 
+def part_names(rd):
+    """A split round's slices plus its cross-file pass, in order; empty for a round in one piece."""
+    meta = rd / "round.json"
+    return read_json(meta).get("parts", []) if meta.exists() else []
+
+
+def part_dirs(rd):
+    """Where each pass keeps its prompt, diff and reviewer files: the round folder, or one folder per slice."""
+    return [rd / name for name in part_names(rd)] or [rd]
+
+
+def part_dir(rd, name):
+    parts = part_names(rd)
+    if not name:
+        if parts:
+            die(f"This round is split. Name the slice with --slice: {', '.join(parts)}")
+        return rd
+    if name not in parts:
+        die(f"No slice {name} in this round." + (f" Use {', '.join(parts)}." if parts else " It isn't split."))
+    return rd / name
+
+
+def label(who, pd):
+    """A reviewer's name, plus the slice when the round is split."""
+    return f"{who} {pd.name}" if (pd.parent / "round.json").exists() and pd.name in part_names(pd.parent) else who
+
+
+# ---------- slices ----------
+
+def nbytes(text):
+    return len(text.encode("utf-8", "replace"))
+
+
+def kb(n):
+    return max(1, round(n / 1024))
+
+
+def diff_files(diff):
+    """The diff as (path, text) per file, in diff order."""
+    files = []
+    for line in diff.splitlines(keepends=True):
+        if line.startswith("diff --git "):
+            m = re.match(r'diff --git "?a/(.*?)"? "?b/(.*?)"?\s*$', line)
+            files.append([m.group(2) if m else line.split()[-1], [line]])
+        elif files:
+            files[-1][1].append(line)
+    return [(path, "".join(lines)) for path, lines in files]
+
+
+def split_hunks(text, limit):
+    """One file's diff in pieces of at most `limit` bytes, cut between hunks; each piece keeps the file header."""
+    lines = text.splitlines(keepends=True)
+    first = next((i for i, ln in enumerate(lines) if ln.startswith("@@")), None)
+    if first is None:
+        return [text]
+    head, hunks = "".join(lines[:first]), []
+    for ln in lines[first:]:
+        if ln.startswith("@@") or not hunks:
+            hunks.append("")
+        hunks[-1] += ln
+    pieces, cur = [], ""
+    for hunk in hunks:
+        if cur and nbytes(head + cur + hunk) > limit:
+            pieces.append(head + cur)
+            cur = ""
+        cur += hunk
+    return pieces + [head + cur]
+
+
+def plan_slices(diff, limit):
+    """Split a diff by folder into slices of at most `limit` bytes. Neighbouring folders share a slice
+    when they fit, and a file over the limit is cut between hunks. Returns lists of (path, text)."""
+    items = []
+    for path, text in diff_files(diff):
+        items += [(path, piece) for piece in (split_hunks(text, limit) if nbytes(text) > limit else [text])]
+    items.sort(key=lambda item: item[0].split("/"))  # Stable, so a cut file's pieces stay in order.
+
+    def size(group):
+        return sum(nbytes(text) for _, text in group)
+
+    def pack(groups):
+        out = []
+        for g in groups:
+            if out and size(out[-1]) + size(g) <= limit:
+                out[-1] = out[-1] + g
+            else:
+                out.append(list(g))
+        return out
+
+    def split(group, depth):
+        if size(group) <= limit:
+            return [group]
+        children = {}
+        for item in group:
+            parts = item[0].split("/")
+            key = parts[depth] if depth < len(parts) - 1 else "\0" + item[0]  # A file in this folder.
+            children.setdefault(key, []).append(item)
+        groups = []
+        for key, sub in children.items():
+            groups += [[item] for item in sub] if key.startswith("\0") else split(sub, depth + 1)
+        return pack(groups)
+
+    return split(items, 0) if items else []
+
+
+def slice_files(items):
+    return list(dict.fromkeys(path for path, _ in items))
+
+
+def slice_folder(items):
+    dirs = {os.path.dirname(p) for p in slice_files(items)}
+    common = os.path.commonpath(sorted(dirs)) if dirs else ""
+    return common or ", ".join(sorted({d.split("/")[0] or "(top)" for d in dirs})[:3])
+
+
+def slice_outline(names, slices):
+    """Each slice's files with their change counts and hunk headers, for the cross-file pass."""
+    out = []
+    for name, items in zip(names, slices):
+        out += [f"# {name}: {slice_folder(items)}", ""]
+        for path, text in items:
+            lines = text.splitlines()
+            adds = sum(ln.startswith("+") and not ln.startswith("+++") for ln in lines)
+            dels = sum(ln.startswith("-") and not ln.startswith("---") for ln in lines)
+            out.append(f"{path} (+{adds} -{dels})")
+            out += ["  " + ln for ln in lines if ln.startswith(("@@", "new file", "deleted file", "rename ",
+                                                                   "similarity", "Binary files"))]
+        out.append("")
+    return "\n".join(out)
+
+
 def changed_paths(top, left_out=()):
     """Changed and untracked paths, minus anything the owner left out of the review."""
     raw = subprocess.run(["git", "-C", str(top), "status", "--porcelain", "-z", "--untracked-files=all"],
@@ -279,7 +415,7 @@ def finish_attempt(rd, who, n, status, final_path, extra):
     write_json(rd / f"{who}.a{n}.meta.json", meta)
     if status == "ok":
         shutil.copyfile(final_path, rd / f"{who}.final.md")
-    print(f"{who} attempt {n}: {status}; {len(findings)} finding(s).")
+    print(f"{label(who, rd)} attempt {n}: {status}; {len(findings)} finding(s).", flush=True)
     for problem in problems[:5]:
         print(f"  {problem}")
     sys.exit(0 if status == "ok" else 1)
@@ -491,6 +627,7 @@ def cmd_init(a):
         "reviewers": reviewers, "fast": fast, "effort": effort, "max_rounds": rounds, "caps": run_caps,
         "start_head": head, "started_at": now(), "rounds": 0,
         "created_branch": created, "snapshot_commit": snapshot, "left_out": left_out,
+        "slices": {"over": SLICE_OVER, "max": SLICE_MAX},
         "phase_rounds": {"code": 0, "docs": 0, "final": 0, "evidence": 0},
         "phases": {"code": "pending", "docs": "pending", "final": "pending"},
         "open_round": None, "last_reviewed": None, "stopped": None, "finished": False,
@@ -563,7 +700,8 @@ def cmd_next(a):
         die("Empty delta: nothing changed since the last reviewed commit.")
     rd = round_dir(run, n)
     rd.mkdir(parents=True)
-    diff = subprocess.run(["git", "-C", str(top), "diff", f"{start}..{head}"], capture_output=True,
+    diff = subprocess.run(["git", "-C", str(top), "diff", "--no-color", "--no-ext-diff", "--src-prefix=a/",
+                           "--dst-prefix=b/", f"{start}..{head}"], capture_output=True,
                           text=True, timeout=120, stdin=subprocess.DEVNULL).stdout
     (rd / "diff.patch").write_text(diff)
     findings = read_tsv(run / "findings.tsv")
@@ -572,27 +710,71 @@ def cmd_next(a):
     ledger = [f"- {f['id']} {f['loc']}: {f['note']}" for f in findings if f["status"] == "rejected"]
     sev_label = "/".join(sorted(ALLOWED[phase]))
     cap = f" of {caps(s)[phase]}" if phase in caps(s) else ""
-    parts = [
-        "# Multi-model review round", "",
-        f"Phase: {phase.capitalize()}",
-        f"Round: {n} (phase round {pr}{cap}; hard stop {max_rounds(s)})",
-        f"Base commit: {s['base_commit']}",
-        f"Reviewed commit: {head}",
-        f"Review range: {scope.capitalize()}: git diff {start}..{head}",
-        f"Diff file: {rd / 'diff.patch'}", "",
-        "## Intent", "", (run / "intent.md").read_text().strip(), "",
-        "## This round", "", scope_text(phase, scope, sev_label), "",
-    ]
-    if a.note:
-        parts += ["## New evidence", "", a.note, ""]
-    parts += [
-        RULES_FILE.read_text().strip(), "",
-        "## Fixes since the last round", "", "\n".join(fixes) or "None.", "",
-        "## Rejection ledger", "", "\n".join(ledger) or "None.", "",
-    ]
-    (rd / "prompt.md").write_text("\n".join(parts))
-    write_json(rd / "round.json", {"round": n, "phase": phase, "phase_round": pr, "scope": scope,
-                                   "commit": head, "range_start": start, "started_at": now()})
+
+    def prompt(diff_file, this_round, extra=()):
+        parts = [
+            "# Multi-model review round", "",
+            f"Phase: {phase.capitalize()}",
+            f"Round: {n} (phase round {pr}{cap}; hard stop {max_rounds(s)})", *extra,
+            f"Base commit: {s['base_commit']}",
+            f"Reviewed commit: {head}",
+            f"Review range: {scope.capitalize()}: git diff {start}..{head}",
+            f"Diff file: {diff_file}", "",
+            "## Intent", "", (run / "intent.md").read_text().strip(), "",
+            "## This round", "", this_round, "",
+        ]
+        if a.note:
+            parts += ["## New evidence", "", a.note, ""]
+        parts += [
+            RULES_FILE.read_text().strip(), "",
+            "## Fixes since the last round", "", "\n".join(fixes) or "None.", "",
+            "## Rejection ledger", "", "\n".join(ledger) or "None.", "",
+        ]
+        return "\n".join(parts)
+
+    split = s.get("slices")
+    slices = plan_slices(diff, split["max"]) if scope == "full" and split and nbytes(diff) > split["over"] else []
+    names = [f"s{i}" for i in range(1, len(slices) + 1)] if len(slices) > 1 else []
+    meta = {"round": n, "phase": phase, "phase_round": pr, "scope": scope,
+            "commit": head, "range_start": start, "started_at": now()}
+    lines = []
+    if names:
+        size = kb(nbytes(diff))
+        for name, items in zip(names, slices):
+            pd = rd / name
+            pd.mkdir()
+            (pd / "diff.patch").write_text("".join(text for _, text in items))
+            files = slice_files(items)
+            listing = "\n".join(f"- {p} ({kb(sum(nbytes(t) for q, t in items if q == p))} KB)" for p in files)
+            (pd / "prompt.md").write_text(prompt(pd / "diff.patch", (
+                f"Review the full diff of the files in this slice. The round's diff is {size} KB, so it is split "
+                f"by folder into {len(names)} slices, each with its own pass, plus a cross-file pass. Focus on "
+                "these files, and report a problem elsewhere only if this slice's code causes it. You may open "
+                f"any file for context. Report {sev_label} only.\n\nFiles in this slice:\n{listing}"),
+                [f"Slice: {name} of {len(names)}, plus a cross-file pass"]))
+            lines.append(f"Slice {name}: {len(files)} file(s), {kb(nbytes((pd / 'diff.patch').read_text()))} KB, "
+                         f"{slice_folder(items)}; prompt {pd / 'prompt.md'}")
+        pd = rd / CROSS
+        pd.mkdir()
+        (pd / "diff.patch").write_text(slice_outline(names, slices))
+        (pd / "prompt.md").write_text(prompt(pd / "diff.patch", (
+            f"Cross-file pass. The round's diff is {size} KB, so it is split by folder into {len(names)} slices, "
+            "and other passes review each slice line by line. Look only for problems that cross slices: A caller "
+            "and callee changed in different slices, a changed contract, type, schema, config or file format "
+            "that code in another slice relies on, removed or renamed code still used elsewhere, and ordering "
+            "or shared state across modules. The diff file lists each slice's files with their hunk headers. "
+            f"Read the whole diff ({rd / 'diff.patch'}) in parts as needed, and open any file for context. "
+            f"Report {sev_label} only."), ["Slice: cross-file pass over every slice"]))
+        lines.append(f"Slice {CROSS}: Every file's hunk headers, {kb(nbytes((pd / 'diff.patch').read_text()))} KB; "
+                     f"prompt {pd / 'prompt.md'}")
+        (rd / "prompt.md").write_text("\n".join([
+            "# Multi-model review round (split)", "",
+            f"Round {n} is split into {len(names)} slices plus a cross-file pass. Each has its own prompt:", "",
+            *[f"- {name}: {rd / name / 'prompt.md'}" for name in names + [CROSS]], ""]))
+        meta["parts"] = names + [CROSS]
+    else:
+        (rd / "prompt.md").write_text(prompt(rd / "diff.patch", scope_text(phase, scope, sev_label)))
+    write_json(rd / "round.json", meta)
     s["rounds"] = n
     s["phase_rounds"][phase] = pr
     s["open_round"] = n
@@ -600,12 +782,25 @@ def cmd_next(a):
         phases[phase] = "open"
     save(run, s)
     print(f"Round {n}: {phase} phase round {pr}, {scope} range {start[:12]}..{head[:12]}")
-    print(f"Prompt: {rd / 'prompt.md'}")
+    if names:
+        print(f"Split: The {kb(nbytes(diff))} KB diff is {len(names)} slices of at most {kb(split['max'])} KB, "
+              "plus a cross-file pass. Every reviewer reviews every slice and the cross-file pass, in parallel.")
+        print("\n".join(lines))
+    else:
+        print(f"Prompt: {rd / 'prompt.md'}")
     print(settings_line(s))
     for who in panel(s):
+        if who in MODELS and names:
+            print(f"Codex {who}: `mmr.py codex --reviewer {who}` runs all {len(names) + 1} passes at once, "
+                  f"and `mmr.py monitor --reviewer {who}` watches them all.")
         if who in AGENT_MODEL:
-            print(f"Claude Agent {who}: model {AGENT_MODEL[who]}, effort {effort_for(s, who)}, "
-                  f"answer file {rd / (who + '.answer.md')}")
+            for name in names + [CROSS] if names else [None]:
+                if name:
+                    print(f"Claude Agent {who} {name}: model {AGENT_MODEL[who]}, effort {effort_for(s, who)}, "
+                          f"prompt {rd / name / 'prompt.md'}, answer file {rd / name / (who + '.answer.md')}")
+                else:
+                    print(f"Claude Agent {who}: model {AGENT_MODEL[who]}, effort {effort_for(s, who)}, "
+                          f"answer file {rd / (who + '.answer.md')}")
     old_location_note(repo_root(a.repo), run)
 
 
@@ -615,7 +810,9 @@ def cmd_codex(a):
     who = a.reviewer
     if who not in panel(s):
         die(f"{who} isn't a reviewer on this run.")
-    rd = round_dir(run, n)
+    if part_names(round_dir(run, n)) and not a.slice:
+        codex_all_slices(a, round_dir(run, n), who)
+    rd = part_dir(round_dir(run, n), a.slice)
     attempt = next_attempt_allowed(rd, who)
     log = rd / f"{who}.a{attempt}.jsonl"
     err = rd / f"{who}.a{attempt}.err"
@@ -676,6 +873,27 @@ def cmd_codex(a):
     })
 
 
+def codex_all_slices(a, rd, who):
+    """Run one Codex pass per slice of a split round, all at once. Each pass is a normal runner with
+    its own PID, logs and limits; reruns name their slice."""
+    todo = [name for name in part_names(rd) if reviewer_status(rd / name, who) == "not started"]
+    if not todo:
+        die("Every slice has a run already. Rerun one slice with --slice <name>.")
+    cmd = [sys.executable, str(Path(__file__).resolve()), "--repo", a.repo, "codex", "--reviewer", who,
+           *(["--standard-tier"] if a.standard_tier else [])]
+    procs = [subprocess.Popen(cmd + ["--slice", name], stdin=subprocess.DEVNULL) for name in todo]
+
+    def stop_children(*_):
+        for proc in procs:
+            if proc.poll() is None:
+                proc.terminate()
+
+    signal.signal(signal.SIGTERM, stop_children)
+    codes = [proc.wait() for proc in procs]
+    print(f"{who}: {sum(c == 0 for c in codes)} of {len(todo)} slice passes ok.")
+    sys.exit(0 if not any(codes) else 1)
+
+
 def pid_alive(pid):
     r = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True,
                        timeout=10, stdin=subprocess.DEVNULL)
@@ -689,50 +907,67 @@ def cmd_monitor(a):
     n = s["open_round"] or die("No open round.")
     who = a.reviewer
     rd = round_dir(run, n)
+    # A split round's monitor watches every slice unless one is named, one line per event.
+    dirs = [part_dir(rd, a.slice)] if a.slice or not part_names(rd) else part_dirs(rd)
+    watch, failed = [], False
     deadline = time.time() + 30
-    pid_file = None
-    while time.time() < deadline:
-        pids = sorted(rd.glob(f"{who}.a*.pid"), key=lambda p: p.stat().st_mtime)
-        if pids:
-            pid_file = pids[-1]
+    while True:
+        found = {}
+        for pd in dirs:
+            pids = sorted(pd.glob(f"{who}.a*.pid"), key=lambda p: p.stat().st_mtime)
+            if pids:
+                found[pd] = pids[-1]
+        if len(found) == len(dirs) or time.time() >= deadline:
             break
         time.sleep(1)
-    if not pid_file:
-        print(f"FAILED {who}: Runner did not start within 30 seconds.", flush=True)
+    for pd in dirs:
+        if pd not in found:
+            print(f"FAILED {label(who, pd)}: Runner did not start within 30 seconds.", flush=True)
+            failed = True
+            continue
+        attempt = re.search(r"\.a(\d+)\.pid$", found[pd].name).group(1)
+        watch.append({"label": label(who, pd), "slice": pd.name if pd != rd else None,
+                      "pid": int(found[pd].read_text()),
+                      "logs": (pd / f"{who}.a{attempt}.jsonl", pd / f"{who}.a{attempt}.err"),
+                      "meta": pd / f"{who}.a{attempt}.meta.json",
+                      "monitor_log": pd / f"{who}.a{attempt}.monitor.log",
+                      "size": -1, "change": time.time(), "warned": False})
+    if not watch:
         sys.exit(1)
-    attempt = re.search(r"\.a(\d+)\.pid$", pid_file.name).group(1)
-    pid = int(pid_file.read_text())
-    log = rd / f"{who}.a{attempt}.jsonl"
-    err = rd / f"{who}.a{attempt}.err"
-    meta_path = rd / f"{who}.a{attempt}.meta.json"
-    monitor_log = rd / f"{who}.a{attempt}.monitor.log"
     started = time.time()
-    last_size, last_change, warned = -1, time.time(), False
     time.sleep(min(5, TICK_SECONDS))
     while True:
-        alive = pid_alive(pid)
-        size = sum(p.stat().st_size for p in (log, err) if p.exists())
-        if size != last_size:
-            last_size, last_change, warned = size, time.time(), False
-        quiet = time.time() - last_change
-        with open(monitor_log, "a") as fh:
-            fh.write(f"{now()} alive={alive} bytes={size} quiet={int(quiet)}s "
-                     f"elapsed={int(time.time() - started)}s\n")
-        if not alive:
-            if not meta_path.exists():
-                print(f"FAILED {who}: Runner exited without a result.", flush=True)
-                sys.exit(1)
-            meta = read_json(meta_path)
-            word = "FINISHED" if meta["status"] == "ok" else "FAILED"
-            print(f"{word} {who}: {meta['status']}, {meta['findings']} finding(s), "
-                  f"{meta.get('seconds', 0) / 60:.1f} min.", flush=True)
-            sys.exit(0 if meta["status"] == "ok" else 1)
-        if quiet >= QUIET_SECONDS and not warned:
-            print(f"QUIET {who}: No output for {int(quiet / 60)} min; process alive. "
-                  f"Normal at max effort; it stops at {SILENCE_SECONDS // 60} silent minutes.", flush=True)
-            warned = True
+        for w in list(watch):
+            alive = pid_alive(w["pid"])
+            size = sum(p.stat().st_size for p in w["logs"] if p.exists())
+            if size != w["size"]:
+                w["size"], w["change"], w["warned"] = size, time.time(), False
+            quiet = time.time() - w["change"]
+            with open(w["monitor_log"], "a") as fh:
+                fh.write(f"{now()} alive={alive} bytes={size} quiet={int(quiet)}s "
+                         f"elapsed={int(time.time() - started)}s\n")
+            if not alive:
+                watch.remove(w)
+                if not w["meta"].exists():
+                    print(f"FAILED {w['label']}: Runner exited without a result.", flush=True)
+                    failed = True
+                    continue
+                meta = read_json(w["meta"])
+                word = "FINISHED" if meta["status"] == "ok" else "FAILED"
+                failed = failed or meta["status"] != "ok"
+                print(f"{word} {w['label']}: {meta['status']}, {meta['findings']} finding(s), "
+                      f"{meta.get('seconds', 0) / 60:.1f} min.", flush=True)
+            elif quiet >= QUIET_SECONDS and not w["warned"]:
+                print(f"QUIET {w['label']}: No output for {int(quiet / 60)} min; process alive. "
+                      f"Normal at max effort; it stops at {SILENCE_SECONDS // 60} silent minutes.", flush=True)
+                w["warned"] = True
+        if not watch:
+            sys.exit(1 if failed else 0)
         if time.time() - started >= MONITOR_CAP_SECONDS:
-            print(f"RE-ARM {who}: Still running at the monitor cap; start the monitor again.", flush=True)
+            for w in watch:
+                again = f" with --slice {w['slice']}" if w["slice"] else ""
+                print(f"RE-ARM {w['label']}: Still running at the monitor cap; start the monitor again{again}.",
+                      flush=True)
             sys.exit(0)
         time.sleep(TICK_SECONDS)
 
@@ -740,7 +975,7 @@ def cmd_monitor(a):
 def cmd_claude_result(a):
     run, s = load(a.repo)
     n = s["open_round"] or die("No open round.")
-    rd = round_dir(run, n)
+    rd = part_dir(round_dir(run, n), a.slice)
     claude = [r for r in panel(s) if r in AGENT_MODEL]
     if not claude:
         die("This run has no Claude reviewer.")
@@ -763,7 +998,7 @@ def cmd_reread(a):
     run, s = load(a.repo)
     n = s["open_round"] or die("No open round.")
     who = a.reviewer
-    rd = round_dir(run, n)
+    rd = part_dir(round_dir(run, n), a.slice)
     done = attempts(rd, who)
     if not done or done[-1]["status"] != "malformed":
         die(f"{who} has no malformed answer to re-read.")
@@ -778,14 +1013,66 @@ def cmd_barrier(a):
     run, s = load(a.repo)
     n = s["open_round"] or die("No open round.")
     rd = round_dir(run, n)
-    statuses = {who: reviewer_status(rd, who) for who in panel(s)}
+    statuses = {label(who, pd): reviewer_status(pd, who) for who in panel(s) for pd in part_dirs(rd)}
     for who, status in statuses.items():
         print(f"{who}: {status}")
     if all(status == "ok" for status in statuses.values()):
+        if part_names(rd):
+            write_answers(rd, panel(s))
+            print(f"Answers: {rd / 'answers.md'} has every slice's answers, with findings at nearby lines "
+                  "grouped as likely duplicates.")
         print("Barrier passed: triage may start.")
         return
     print("Barrier not passed: edit nothing yet.")
     sys.exit(1)
+
+
+LOC_PARTS_RE = re.compile(r"([\w./()@+~-]+):(\d+)(?:-(\d+))?")
+
+
+def write_answers(rd, reviewers):
+    """One file with every slice's answers, so triage can merge findings across slices."""
+    found, body = [], []
+    for pd in part_dirs(rd):
+        body += [f"## {pd.name}", ""]
+        for who in reviewers:
+            text = (pd / f"{who}.final.md").read_text().strip()
+            body += [f"### {who}", "", text, ""]
+            for sev, loc in parse_final(text)[1]:
+                m = LOC_PARTS_RE.fullmatch(loc)
+                if m:
+                    found.append((m.group(1), int(m.group(2)), f"{who} {pd.name} {sev}"))
+    groups = []
+    for path, line, who in sorted(found, key=lambda f: f[:2]):
+        if groups and groups[-1][0] == path and line - groups[-1][2] <= 5:
+            groups[-1][2] = line
+            groups[-1][3].append(who)
+        else:
+            groups.append([path, line, line, [who]])
+    dups = [f"- {p}:{lo}" + (f"-{hi}" if hi != lo else "") + ": " + ", ".join(names)
+            for p, lo, hi, names in groups if len(set(names)) > 1]
+    (rd / "answers.md").write_text("\n".join([
+        f"# Round {int(rd.name)} answers, every slice", "",
+        "Write one triage.tsv row per merged finding, listing every reviewer who raised it.", "",
+        "## Likely duplicates (same file, within 5 lines)", "", "\n".join(dups) or "None found.", "",
+        *body]))
+
+
+def merge_duplicates(rows):
+    """Rows with the same location and summary are one finding: Keep one row with every reviewer."""
+    merged, seen = [], {}
+    for row in rows:
+        key = (row["loc"].lower(), " ".join(re.findall(r"\w+", row["summary"].lower())))
+        first = seen.get(key)
+        if not first:
+            seen[key] = row
+            merged.append(row)
+            continue
+        if (first["sev"], first["status"]) != (row["sev"], row["status"]):
+            die(f"Two triage rows for {row['loc']} have the same summary but a different severity or status. "
+                "Merge them into one row.")
+        first["reviewers"] += [r for r in row["reviewers"] if r not in first["reviewers"]]
+    return merged
 
 
 def read_triage(rd, raised):
@@ -826,12 +1113,13 @@ def cmd_close(a):
     top = Path(s["repo"])
     rd = round_dir(run, n)
     for who in panel(s):
-        if reviewer_status(rd, who) != "ok":
+        if any(reviewer_status(pd, who) != "ok" for pd in part_dirs(rd)):
             die("Barrier not passed. Run `mmr.py barrier`.")
     meta = read_json(rd / "round.json")
     phase = meta["phase"]
-    raised = {who: len(parse_final((rd / f"{who}.final.md").read_text())[1]) for who in panel(s)}
-    rows = read_triage(rd, raised)
+    raised = {who: sum(len(parse_final((pd / f"{who}.final.md").read_text())[1]) for pd in part_dirs(rd))
+              for who in panel(s)}
+    rows = merge_duplicates(read_triage(rd, raised))
     for row in rows:
         if row["status"] != "rejected" and row["sev"] not in ALLOWED[phase]:
             die(f"{row['sev']} is outside the {phase} phase: reject it as out of phase.")
@@ -915,9 +1203,12 @@ def cmd_status(a):
         print(f"Stopped: {s['stopped']}")
     if s["open_round"]:
         rd = round_dir(run, s["open_round"])
-        print(f"Open round: {s['open_round']} ({read_json(rd / 'round.json')['phase']})")
+        parts = part_names(rd)
+        print(f"Open round: {s['open_round']} ({read_json(rd / 'round.json')['phase']})"
+              + (f", split into {', '.join(parts)}" if parts else ""))
         for who in panel(s):
-            print(f"  {who}: {reviewer_status(rd, who)}")
+            for pd in part_dirs(rd):
+                print(f"  {label(who, pd)}: {reviewer_status(pd, who)}")
 
 
 def cmd_migrate(a):
@@ -930,7 +1221,7 @@ def cmd_migrate(a):
     if src.parent == root:
         print(f"Already in the new location: {src}")
         return
-    busy = [p.name for p in src.glob("rounds/*/*.pid")
+    busy = [p.name for p in [*src.glob("rounds/*/*.pid"), *src.glob("rounds/*/*/*.pid")]
             if not p.with_name(p.name[:-len(".pid")] + ".meta.json").exists()
             and pid_alive(int(p.read_text()))]
     if busy:
@@ -941,7 +1232,7 @@ def cmd_migrate(a):
         root.mkdir(parents=True, exist_ok=True)
         shutil.rmtree(tmp, ignore_errors=True)
         shutil.copytree(src, tmp, symlinks=True)
-        for prompt in tmp.glob("rounds/*/prompt.md"):
+        for prompt in [*tmp.glob("rounds/*/prompt.md"), *tmp.glob("rounds/*/*/prompt.md")]:
             prompt.write_text(prompt.read_text().replace(str(src), str(dst)))
         os.rename(tmp, dst)
     (root / "latest").write_text(dst.name + "\n")
@@ -965,17 +1256,19 @@ def reviewer_stats(run, s):
         st = {"raised": 0, "p01": 0, "p2": 0, "accepted": 0, "rejected": 0, "unique": 0,
               "unique_accepted_p01": 0, "clean_rounds": 0, "minutes": []}
         for n in range(1, s["rounds"] + 1):
-            rd = round_dir(run, n)
-            final = rd / f"{who}.final.md"
-            if final.exists():
-                _, found, _ = parse_final(final.read_text())
-                st["raised"] += len(found)
-                st["p01"] += sum(sev in ("P0", "P1") for sev, _ in found)
-                st["p2"] += sum(sev == "P2" for sev, _ in found)
-                st["clean_rounds"] += not found
-            good = [m for m in attempts(rd, who) if m["status"] == "ok"]
-            if good and good[-1].get("seconds"):
-                st["minutes"].append(float(good[-1]["seconds"]) / 60)
+            finals = [pd / f"{who}.final.md" for pd in part_dirs(round_dir(run, n))]
+            finals = [f for f in finals if f.exists()]
+            found = [item for f in finals for item in parse_final(f.read_text())[1]]
+            st["raised"] += len(found)
+            st["p01"] += sum(sev in ("P0", "P1") for sev, _ in found)
+            st["p2"] += sum(sev == "P2" for sev, _ in found)
+            st["clean_rounds"] += bool(finals) and not found
+            # A split round's passes run in parallel, so its time is its longest pass.
+            seconds = [float(good[-1]["seconds"]) for pd in part_dirs(round_dir(run, n))
+                       for good in [[m for m in attempts(pd, who) if m["status"] == "ok"]]
+                       if good and good[-1].get("seconds")]
+            if seconds:
+                st["minutes"].append(max(seconds) / 60)
         for f in findings:
             names = f["reviewers"].split(",")
             if who not in names:
@@ -1034,7 +1327,8 @@ def cmd_archive(a):
     ids = []
     for n in range(1, s["rounds"] + 1):
         for who in MODELS:
-            ids += [m["thread_id"] for m in attempts(round_dir(run, n), who) if m.get("thread_id")]
+            ids += [m["thread_id"] for pd in part_dirs(round_dir(run, n))
+                    for m in attempts(pd, who) if m.get("thread_id")]
     failed = 0
     for thread_id in ids:
         r = subprocess.run([CODEX, "archive", thread_id], capture_output=True, text=True,
@@ -1046,6 +1340,22 @@ def cmd_archive(a):
     save(run, s)
     print(f"Archived {len(ids) - failed} of {len(ids)} Codex chats.")
     sys.exit(1 if failed else 0)
+
+
+def cmd_slices(a):
+    """Show how a diff file would be split. Reads only that file."""
+    diff = Path(a.diff).read_text()
+    size, slices = nbytes(diff), plan_slices(diff, a.max)
+    names = [f"s{i}" for i in range(1, len(slices) + 1)]
+    split = size > a.over and len(slices) > 1
+    print(f"Diff: {kb(size)} KB in {len(diff_files(diff))} file(s). Split (over {kb(a.over)} KB): "
+          f"{'Yes' if split else 'No'}")
+    for name, items in zip(names, slices):
+        print(f"{name}: {kb(sum(nbytes(t) for _, t in items))} KB, {len(slice_files(items))} file(s), "
+              f"{slice_folder(items)}")
+        if a.files:
+            print("\n".join(f"  {p}" for p in slice_files(items)))
+    print(f"{CROSS}: {kb(nbytes(slice_outline(names, slices)))} KB of file names and hunk headers")
 
 
 def main():
@@ -1077,20 +1387,30 @@ def main():
     c.add_argument("--phase", required=True, choices=["code", "docs", "final", "evidence"])
     c.add_argument("--note")
     c.set_defaults(fn=cmd_next)
+    slice_help = "In a split round: the slice (s1, s2, ... or cross)"
     for name, fn in (("codex", cmd_codex), ("monitor", cmd_monitor)):
         c = sub.add_parser(name)
         c.add_argument("--reviewer", required=True, choices=list(MODELS))
+        c.add_argument("--slice", help=slice_help + "; without it, every slice")
         if name == "codex":
             c.add_argument("--standard-tier", action="store_true", help="Leave out the priority (fast) service tier")
         c.set_defaults(fn=fn)
     c = sub.add_parser("claude-result")
     c.add_argument("--reviewer", choices=list(AGENT_MODEL), help="Needed when the run has 2+ Claude reviewers")
+    c.add_argument("--slice", help=slice_help)
     c.add_argument("--seconds", type=float, required=True)
     c.add_argument("--file")
     c.set_defaults(fn=cmd_claude_result)
     c = sub.add_parser("reread")
     c.add_argument("--reviewer", required=True, choices=ALL_REVIEWERS + ["claude"])
+    c.add_argument("--slice", help=slice_help)
     c.set_defaults(fn=cmd_reread)
+    c = sub.add_parser("slices", help="Show how a diff file would be split; starts nothing")
+    c.add_argument("--diff", required=True)
+    c.add_argument("--over", type=int, default=SLICE_OVER)
+    c.add_argument("--max", type=int, default=SLICE_MAX)
+    c.add_argument("--files", action="store_true", help="List each slice's files")
+    c.set_defaults(fn=cmd_slices)
     c = sub.add_parser("close")
     c.add_argument("--tests")
     c.set_defaults(fn=cmd_close)
