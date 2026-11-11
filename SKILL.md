@@ -60,7 +60,7 @@ Below, `mmr <command>` is short for that full call.
    - `RE-ARM`: Start that monitor again, with the `--slice` the line names.
 4. When a Claude Agent returns, Write its final message unchanged to its answer file from step 1, then run `mmr claude-result --reviewer <name> --seconds <duration_ms / 1000>`, adding `--slice <slice>` in a split round.
 5. Run `mmr barrier`. Edit nothing until it passes. If a result is empty or missing, rerun only that reviewer, at the same commit; the round doesn't count again. In a split round, rerun only that reviewer's failed slice: `mmr codex --reviewer <name> --slice <slice>` with its own `mmr monitor --reviewer <name> --slice <slice>`. For a Claude reviewer, spawn a fresh Agent and repeat step 4. The helper refuses a third attempt and any rerun after a stall or timeout: Then run `mmr stop --reason "<why>"` and go to Done. Exception: A run from before the format rules were dropped may show `malformed` on a real answer. Run `mmr reread --reviewer <who>`, which reads the saved answer again with no new reviewer run.
-6. Triage (see Fixer rules), and write `triage.tsv` in the round folder with the Write tool. In a split round, the barrier writes `answers.md` in the round folder: Every slice's answers, with findings at nearby lines listed as likely duplicates. Triage from it, one row per merged finding across slices; `close` also merges rows with the same `loc` and summary.
+6. Triage (see Fixer rules), and write `triage.tsv` in the round folder with the Write tool. In a split round, the barrier writes `answers.md` in the round folder: Every slice's answers, with findings at nearby lines listed as likely duplicates. Triage from it, one row per merged finding across slices; `close` also merges rows with the same `loc` and summary. In Final, run `mmr ages` after writing `triage.tsv` and before fixing: It marks late rows and says which to fix (late P0) and which to list as `open` (late P1).
 7. Fix accepted findings, run the affected tests, and make one WIP commit. A failing test blocks the round, so a bad fix can't reach the next delta.
 8. Run `mmr close --tests "<exact test command>"`, or `--tests "none: docs only"`. With nothing accepted, omit `--tests`. Follow the `Next:` line it prints.
 
@@ -73,7 +73,7 @@ terra	P1	src/b.py:9	rejected	Null token crashes	Token is non-null: src/auth.py:3
 ```
 
 - `loc` is `path:line` from the repo root. `close` dates each row with git blame on the lines around it: `before-branch`, `seen-in-full` (code a full Code sweep already reviewed) or `newer`. `mmr ages` shows these dates and changes nothing.
-- `status` is `accepted`, `rejected`, or `open`. `open` is only for the last allowed round, where a fix would go unreviewed.
+- `status` is `accepted`, `rejected`, or `open`. `open` is only for the last allowed round, where a fix would go unreviewed, and for a late P1 in Final.
 - `note` is what changed (accepted), the code-cited reason (rejected), or why it's left (open). Accepted and rejected notes feed the next prompt's fix list and ledger.
 - Reject out-of-phase findings as "Out of phase".
 - Reviewers can answer in any format, so read each answer yourself. Finding counts are a best guess. An answer with no P0/P1/P2 tags counts as one finding: Add a row for what it raises, or one `rejected` row if it raises nothing.
@@ -89,7 +89,7 @@ WIP commits: Message `WIP multimodel-review round <N>`, written to a file and pa
    - Run the full test suite. If it fails, fix it; if you can't with a small fix, stop and report.
    - Commit, then Write `cleanup.md` in the run folder: Each deletion with its reason, and the exact test command and result. `next --phase docs` refuses without it.
 3. **Docs:** One full-diff round at P2, fix, then one delta round. Then the phase ends; anything left is recorded as open.
-4. **Final:** One full-diff round with all reviewers, P0/P1 only. If a finding is accepted, fix it and run one delta round. If that still fails, mark it open; the helper stops the run.
+4. **Final:** A check, not a fresh search. Round 1 reviews the code written since the last full Code sweep, plus its effects on callers, with all reviewers, P0/P1 only. If nothing changed since that sweep, `next` marks Final converged. A Final finding on code a full sweep already reviewed is tagged `late`, and the report counts them. Late P0s are always fixed. Late P1s get status `open` with a note: The report lists them, and they neither block Final nor loop. If another finding is accepted, fix it and run one delta round. If that still fails, mark it open; the helper stops the run. Runs started before this change keep a full Final round 1.
 
 ## Convergence
 
@@ -112,8 +112,8 @@ WIP commits: Message `WIP multimodel-review round <N>`, written to a file and pa
 Run this on convergence and on any stop.
 
 1. Run `mmr archive` to archive every Codex chat, reruns included.
-2. Run `mmr report`. It prints rounds per phase, the reviewer table, open items, disputed findings, test commands, and the squash command, and saves `report.md`.
-3. Report to the owner, short and answer first: Rounds per phase, open items, exact validation commands and results.
+2. Run `mmr report`. It prints rounds per phase, the full sweeps, the late count, the reviewer table, open items, listed late P1s, disputed findings, test commands, and the squash command, and saves `report.md`.
+3. Report to the owner, short and answer first: Rounds per phase, open items, late count, exact validation commands and results.
 4. Show a simple visual per reviewer, inline: Findings raised, accepted, rejected, unique, P0-P1 vs P2, clean rounds, average minutes per round. Name your winner in one line. The default rule is most accepted unique P0/P1, and you should say if you overrule it, since you're judging your own model too.
 5. Leave the WIP commits in place, because evidence rounds need the delta range. Ask with a button whether to squash now, and run the squash from the report only on a yes.
 

@@ -508,8 +508,8 @@ def sweep_tests(tmp, env, intent):
     mod = load_module()
     s = json.loads((run / "run.json").read_text())
     s["phases"]["code"] = "open"
-    rows = (run / "rounds.tsv").read_text().splitlines()
-    (run / "rounds.tsv").write_text("\n".join(rows[:3]) + "\n")  # As if round 2 just closed.
+    saved = (run / "rounds.tsv").read_text()
+    (run / "rounds.tsv").write_text("\n".join(saved.splitlines()[:3]) + "\n")  # As if round 2 just closed.
     check(mod.code_scope(run, s)[0] == "full", "sweep 2's bug on reviewed code asks for sweep 3")
     check(mod.code_scope(run, {**s, "full_sweeps": 2}) == ("delta", "2 full sweeps is the cap, so delta rounds "
                                                            "check the fixes"), "the sweep cap goes back to delta")
@@ -518,6 +518,68 @@ def sweep_tests(tmp, env, intent):
           == ["full", "full", "delta", "delta"], "runs saved before sweeps keep rounds 1-2 full")
     gone = repo / ".claude" / "worktrees" / "gone"
     check(mod.Dater(str(gone), s["base_commit"]).repo == str(repo), "a missing worktree reads the main repo")
+    (run / "rounds.tsv").write_text(saved)
+
+    # Final checks the code since the last full sweep. Late P0s are fixed; late P1s are listed, not looped on.
+    sweep3 = mmr_tsv(run / "rounds.tsv")[2]["commit"]
+    (run / "cleanup.md").write_text("Deleted nothing. Tests: make test passed.\n")
+    check(mmr("next", "--phase", "docs")[0] == 0, "docs round")
+    modes.write_text("clean")
+    mmr("codex", "--reviewer", "terra")
+    (run / "rounds" / "05" / "opus.answer.md").write_text("NO BLOCKING ISSUES.")
+    mmr("claude-result", "--seconds", "1")
+    check(mmr("close")[0] == 0, "docs clean")
+    code, out = mmr("next", "--phase", "final")
+    check(code == 0 and f"since-sweep range {sweep3[:12]}" in out, "Final starts at the last full sweep")
+    rd = run / "rounds" / "06"
+    check("Check the code changed since the last full Code sweep" in (rd / "prompt.md").read_text()
+          and "+c4 8" in (rd / "diff.patch").read_text() and "+c1 5" not in (rd / "diff.patch").read_text(),
+          "Final's diff is only the code since the sweep")
+    review(6, ["P1\tsrc/deep/f.txt:8\topen\tNew code\tLater"])
+    code, out = mmr("close")
+    check(code == 1 and "only for the last allowed round" in out, "a Final finding on new code can't be left open")
+    (rd / "triage.tsv").write_text(HEADER + "terra\tP1\tsrc/deep/f.txt:5\taccepted\tLate one\tf.txt: Fix 5\n"
+                                   + "terra\tP0\tsrc/deep/f.txt:4\taccepted\tLate P0\tf.txt: Fix 4\n")
+    edit({4: "c5 4"}, "WIP round 6")
+    code, out = mmr("close", "--tests", "make test")
+    check(code == 1 and "This P1 is late" in out, "a late P1 isn't fixed in Final")
+    code, out = mmr("ages")
+    check("seen-in-full late\tsrc/deep/f.txt:5\tLate one\tlate P1: List it as open" in out
+          and "late P0: Fix it" in out, "ages tells which Final rows are late before the fix")
+    (rd / "triage.tsv").write_text(HEADER + "terra\tP1\tsrc/deep/f.txt:5\topen\tLate one\tListed for later\n"
+                                   + "terra\tP0\tsrc/deep/f.txt:4\taccepted\tLate P0\tf.txt: Fix 4\n")
+    code, out = mmr("close", "--tests", "make test")
+    check(code == 0 and "not clean" in out and "1 late P1(s) listed" in out, "late P0 fixed, late P1 listed")
+    check(mmr("next", "--phase", "final")[0] == 0, "Final delta round checks the P0 fix")
+    review(7, ["P1\tsrc/deep/f.txt:6\topen\tLate again\tListed for later"])
+    code, out = mmr("close")
+    check(code == 0 and "Final converged" in out and "STOP" not in out, "late P1s alone don't stop Final")
+    rows = {r["id"]: r for r in mmr_tsv(run / "findings.tsv")}
+    check([rows[i]["tag"] for i in ("R3-3", "R6-1", "R6-2", "R7-1")] == ["", "late", "late", "late"],
+          "only Final rows on swept code get the late tag")
+    report = mmr("report")[1]
+    check("Late Final findings (on code a full sweep already reviewed): 3; 1 fixed, 2 listed" in report
+          and "## Late P1s (listed, not looped on)" in report and "R7-1 [P1]" in report
+          and "## Open items\n\nNone." in report, "report shows the late count and the listed P1s")
+    code, out = mmr("ages")
+    check("Round 6 final (since-sweep): 2 seen-in-full; 2 late" in out, "ages counts late Final findings")
+
+    # A run whose last sweep is HEAD has nothing for Final to check.
+    mmr("stop", "--reason", "Next scenario.")
+    check(mmr("init", "--base", "main", "--intent-file", str(intent), "--new")[0] == 0, "quiet run starts")
+    run = latest_run(repo, env)
+    for n, phase in ((1, "code"), (2, "docs")):
+        if phase == "docs":
+            (run / "cleanup.md").write_text("Nothing.\n")
+        check(mmr("next", "--phase", phase)[0] == 0, f"quiet {phase} round")
+        modes.write_text("clean")
+        mmr("codex", "--reviewer", "terra")
+        (run / "rounds" / f"{n:02d}" / "opus.answer.md").write_text("NO BLOCKING ISSUES.")
+        mmr("claude-result", "--seconds", "1")
+        check(mmr("close")[0] == 0, f"quiet {phase} round closes clean")
+    code, out = mmr("next", "--phase", "final")
+    check(code == 0 and "Nothing changed since the last full sweep" in out, "Final with nothing to check converges")
+    check(json.loads((run / "run.json").read_text())["phases"]["final"] == "converged", "Final is marked converged")
 
 
 def legacy_findings_tests(tmp, env, intent):
@@ -791,8 +853,12 @@ def main():
     reviewers(6)
     check(mmr("close")[0] == 0, "reopened code converges")
 
-    # Final: an accepted finding, then a delta round that still fails.
-    check(mmr("next", "--phase", "final")[0] == 0, "final round")
+    # Final in a run saved before Final became a check: a full round 1, then a delta round that still fails.
+    state = json.loads((run_dir() / "run.json").read_text())
+    state.pop("final_check")
+    (run_dir() / "run.json").write_text(json.dumps(state))
+    code, out = mmr("next", "--phase", "final")
+    check(code == 0 and "full range" in out, "an older run's Final round 1 is full")
     reviewers(7, terra="finding")
     (rd(7) / "triage.tsv").write_text(HEADER + "terra\tP1\ta.txt:1\taccepted\tLast bug\ta.txt: Use seven\n")
     commit("seven\n", "WIP round 7")

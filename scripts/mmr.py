@@ -67,7 +67,7 @@ ALLOWED = {
     "evidence": {"P0", "P1", "P2"},
 }
 TRIAGE_HEADER = ["reviewers", "sev", "loc", "status", "summary", "note"]
-FINDING_COLS = ["id", "round", "phase", "reviewers", "sev", "loc", "status", "summary", "note", "age"]
+FINDING_COLS = ["id", "round", "phase", "reviewers", "sev", "loc", "status", "summary", "note", "age", "tag"]
 ROUND_COLS = ["round", "phase", "phase_round", "scope", "commit", "fix_commit",
               "clean", "accepted", "rejected", "open", "tests"]
 # Reviewers are never held to a format. These only count findings, on a best-effort basis.
@@ -635,6 +635,7 @@ def cmd_init(a):
         "start_head": head, "started_at": now(), "rounds": 0,
         "created_branch": created, "snapshot_commit": snapshot, "left_out": left_out,
         "slices": {"over": SLICE_OVER, "max": SLICE_MAX}, "full_sweeps": min(FULL_SWEEPS, run_caps["code"]),
+        "final_check": True,
         "phase_rounds": {"code": 0, "docs": 0, "final": 0, "evidence": 0},
         "phases": {"code": "pending", "docs": "pending", "final": "pending"},
         "open_round": None, "last_reviewed": None, "stopped": None, "finished": False,
@@ -772,6 +773,12 @@ def code_scope(run, s):
 
 
 def scope_text(phase, scope, sev_label, sweep=0):
+    if scope == "since-sweep":
+        return ("Check the code changed since the last full Code sweep: The diff file holds it, and full sweeps "
+                "already reviewed the rest of the branch. Review this range plus its effects on callers and on "
+                f"other code that uses what it changed. Report {sev_label} only. You may open any file for "
+                "context. Outside this range, report only P0, unless this range causes the failure: then anchor "
+                "the finding to the changed line and give it its real severity.")
     if scope == "full" and sweep > 1:
         return (f"Review the full diff again: This is full sweep {sweep}. Earlier sweeps reviewed this code and "
                 f"still missed bugs, so read every change, not only the fixes. Report {sev_label} only.")
@@ -826,6 +833,15 @@ def cmd_next(a):
     else:
         scope = "delta"
     start = s["base_commit"] if scope == "full" else s["last_reviewed"]
+    if phase == "final" and pr == 1 and s.get("final_check") and sweeps_before(run):
+        # Final is a check: The code written since the last full sweep, plus its effects on callers.
+        scope, start = "since-sweep", sweeps_before(run)[-1]["commit"]
+        if start == head:
+            phases["final"] = "converged"
+            save(run, s)
+            print("Final converged: Nothing changed since the last full sweep, so there is nothing to check. "
+                  "Next: Done steps.")
+            return
     if start == head:
         die("Empty delta: nothing changed since the last reviewed commit.")
     rd = round_dir(run, n)
@@ -1257,9 +1273,22 @@ def cmd_close(a):
     for row in rows:
         if row["status"] != "rejected" and row["sev"] not in ALLOWED[phase]:
             die(f"{row['sev']} is outside the {phase} phase: reject it as out of phase.")
+    sweeps = sweeps_before(run, n)
+    dater = Dater(s["repo"], s["base_commit"])
+    for row in rows:
+        row["age"] = dater.age(row["loc"], meta["commit"], sweeps[-1]["commit"] if sweeps else None)
+        # A Final finding on code a full sweep already reviewed is late.
+        row["tag"] = "late" if phase == "final" and row["age"] == "seen-in-full" else ""
+    listed = []
+    if phase == "final" and s.get("final_check"):
+        for row in rows:
+            if row["tag"] == "late" and row["sev"] == "P1" and row["status"] == "accepted":
+                die(f"{row['loc']}: This P1 is late, on code a full sweep already reviewed. Late P1s are listed, "
+                    "not looped on: Mark it open (the report lists it) or reject it, and leave its fix out.")
+        listed = [r for r in rows if r["tag"] == "late" and r["sev"] == "P1" and r["status"] == "open"]
     accepted = [r for r in rows if r["status"] == "accepted"]
     rejected = [r for r in rows if r["status"] == "rejected"]
-    held = [r for r in rows if r["status"] == "open"]
+    held = [r for r in rows if r["status"] == "open" and all(r is not x for x in listed)]
     hard_last = n >= max_rounds(s)
     phase_last = phase in caps(s) and meta["phase_round"] >= caps(s)[phase]
     last = hard_last or phase_last
@@ -1276,18 +1305,14 @@ def cmd_close(a):
             die("Accepted findings need --tests with the passing test command, or 'none: docs only'.")
     elif head != meta["commit"]:
         die("HEAD moved, but no finding was accepted.")
-    sweeps = sweeps_before(run, n)
-    dater = Dater(s["repo"], s["base_commit"])
-    for row in rows:
-        row["age"] = dater.age(row["loc"], meta["commit"], sweeps[-1]["commit"] if sweeps else None)
     write_tsv_rows(run / "findings.tsv", FINDING_COLS, [
         {"id": f"R{n}-{i}", "round": n, "phase": phase, "reviewers": ",".join(row["reviewers"]),
-         **{k: row[k] for k in ("sev", "loc", "status", "summary", "note", "age")}}
+         **{k: row[k] for k in ("sev", "loc", "status", "summary", "note", "age", "tag")}}
         for i, row in enumerate(rows, 1)])
     clean = not accepted and not held
     with open(run / "rounds.tsv", "a") as fh:
         values = [n, phase, meta["phase_round"], meta["scope"], meta["commit"], head,
-                  "yes" if clean else "no", len(accepted), len(rejected), len(held), a.tests or ""]
+                  "yes" if clean else "no", len(accepted), len(rejected), len(held) + len(listed), a.tests or ""]
         fh.write("\t".join(str(v) for v in values) + "\n")
     s["open_round"] = None
     s["last_reviewed"] = meta["commit"]
@@ -1310,9 +1335,12 @@ def cmd_close(a):
             phases["docs"] = "converged" if clean else "ended"
             message = "Docs finished. Next: mmr.py next --phase final"
     elif phase == "final":
+        if listed:
+            message = (f"{len(listed)} late P1(s) listed for the report, not looped on. " + message)
         if clean:
             phases["final"] = "converged"
-            message = "Final converged. Next: Done steps."
+            message = (f"{len(listed)} late P1(s) listed for the report. " if listed else "") + \
+                "Final converged. Next: Done steps."
         elif held:
             s["stopped"] = "Final delta round still has open findings."
     elif phase == "evidence":
@@ -1330,7 +1358,7 @@ def cmd_close(a):
     ages = [row["age"] for row in rows]
     dated = ", ".join(f"{ages.count(age)} {age}" for age in AGES + ["unknown"] if age in ages)
     print(f"Round {n} closed: {'clean' if clean else 'not clean'}; "
-          f"{len(accepted)} accepted, {len(rejected)} rejected, {len(held)} open."
+          f"{len(accepted)} accepted, {len(rejected)} rejected, {len(held) + len(listed)} open."
           + (f" Code dated by git blame: {dated}." if dated else "") + f"\n{message}")
 
 
@@ -1435,6 +1463,15 @@ def sweep_lines(run, s):
             + (f"). Accepted P0/P1 on code an earlier sweep reviewed: {', '.join(found)}" if found else ")")]
 
 
+def late_lines(run):
+    late = [f for f in read_tsv(run / "findings.tsv") if f.get("tag") == "late" and f["status"] != "rejected"]
+    if not late:
+        return []
+    fixed = sum(f["status"] == "accepted" for f in late)
+    return [f"Late Final findings (on code a full sweep already reviewed): {len(late)}; {fixed} fixed, "
+            f"{len(late) - fixed} listed"]
+
+
 def cmd_report(a):
     run, s = load(a.repo)
     stats, findings = reviewer_stats(run, s)
@@ -1443,7 +1480,7 @@ def cmd_report(a):
            f"Docs {s['phase_rounds']['docs']}, Final {s['phase_rounds']['final']}, "
            f"Evidence {s['phase_rounds']['evidence']}",
            f"Result: {s['stopped'] or 'Converged'}",
-           *sweep_lines(run, s),
+           *sweep_lines(run, s), *late_lines(run),
            settings_line(s),
            f"Branch: {s['branch']}" + (" (created for this run)" if s.get("created_branch") else ""),
            f"Uncommitted work: {'Saved as WIP snapshot ' + s['snapshot_commit'][:12] if s.get('snapshot_commit') else 'None'}",
@@ -1457,7 +1494,12 @@ def cmd_report(a):
                                           stats[w]["rejected"], stats[w]["avg_minutes"]))[0]
     out += ["", f"Leader by rule (accepted unique P0/P1, then accepted, then fewest rejected): {leader}", ""]
     held = [f for f in findings if f["status"] == "open"]
+    listed = [f for f in held if f.get("tag") == "late" and f["sev"] == "P1"] if s.get("final_check") else []
+    held = [f for f in held if f not in listed]
     out += ["## Open items", ""] + ([f"- {f['id']} [{f['sev']}] {f['loc']}: {f['summary']}" for f in held] or ["None."])
+    if listed:
+        out += ["", "## Late P1s (listed, not looped on)", ""]
+        out += [f"- {f['id']} [{f['sev']}] {f['loc']}: {f['summary']}. {f['note']}" for f in listed]
     disputed = [f for f in findings if f["status"] == "rejected"
                 and (len(f["reviewers"].split(",")) > 1 or f["sev"] == "P0")]
     out += ["", "## Disputed (rejected, but raised by 2+ reviewers or at P0)", ""]
@@ -1523,13 +1565,19 @@ def cmd_ages(a):
         if (rd / "triage.tsv").exists():
             for row in read_tsv(rd / "triage.tsv"):
                 age = dater.age(row.get("loc", ""), meta["commit"], last_sweep(n))
-                print(f"{row.get('sev')}\t{row.get('status')}\t{age}\t{row.get('loc')}\t{row.get('summary')}")
+                late = meta["phase"] == "final" and age == "seen-in-full"
+                todo = ("" if not late or not s.get("final_check") else "\tlate P0: Fix it" if row.get("sev") == "P0"
+                        else "\tlate P1: List it as open; don't fix it" if row.get("status") != "rejected" else "")
+                print(f"{row.get('sev')}\t{row.get('status')}\t{age}{' late' if late else ''}\t{row.get('loc')}"
+                      f"\t{row.get('summary')}{todo}")
         else:
             for pd in part_dirs(rd):
                 for who in panel(s):
                     final = pd / f"{who}.final.md"
                     for sev, loc in parse_final(final.read_text())[1] if final.exists() else []:
-                        print(f"{label(who, pd)}\t{sev}\t{dater.age(loc, meta['commit'], last_sweep(n))}\t{loc}")
+                        age = dater.age(loc, meta["commit"], last_sweep(n))
+                        late = " late" if meta["phase"] == "final" and age == "seen-in-full" else ""
+                        print(f"{label(who, pd)}\t{sev}\t{age}{late}\t{loc}")
         return
     rounds = {r["round"]: r for r in read_tsv(run / "rounds.tsv")}
     by_round = {}
@@ -1550,7 +1598,9 @@ def cmd_ages(a):
         who = [f"{w} {sum(w in f['reviewers'].split(',') for f, _ in items)} "
                f"({sum(w in f['reviewers'].split(',') and age == 'seen-in-full' for f, age in items)} seen-in-full)"
                for w in panel(s) if any(w in f["reviewers"].split(",") for f, _ in items)]
-        print(f"Round {rn} {r['phase']} ({r['scope']}): {line}. By reviewer: {', '.join(who)}.")
+        late = sum(age == "seen-in-full" for _, age in items) if r["phase"] == "final" else 0
+        print(f"Round {rn} {r['phase']} ({r['scope']}): {line}" + (f"; {late} late" if late else "")
+              + f". By reviewer: {', '.join(who)}.")
 
 
 def cmd_slices(a):
