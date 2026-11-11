@@ -25,8 +25,10 @@ PICKER_TITLE = "Options for a new multi-model review: Reviewers with effort and 
 RUNS_HOME = Path(os.environ.get("MMR_RUNS_HOME", Path.home() / ".claude" / "multimodel-review"))
 
 MODELS = {"terra": "gpt-6.1-terra", "astra": "gpt-6-astra", "sol": "gpt-6.1-sol", "luna": "gpt-6-luna"}
-REVIEWERS = ["terra", "claude"]  # Default panel; the picker can add Astra, Sol and Luna.
-ALL_REVIEWERS = ["terra", "claude", "astra", "sol", "luna"]
+# Claude reviewers run as the multimodel-reviewer Agent with this model. "claude" is the Opus reviewer of older runs.
+AGENT_MODEL = {"opus": "opus", "fable": "fable", "sonnet": "sonnet", "haiku": "haiku", "claude": "opus"}
+REVIEWERS = ["terra", "opus"]  # Default panel.
+ALL_REVIEWERS = ["terra", "opus", "astra", "fable", "sonnet", "haiku", "luna", "sol"]  # Picker order.
 EFFORTS = ["low", "medium", "high", "xhigh", "max"]  # Codex "ultra" delegates to subagents, which stay off.
 OLD_REVIEWERS = ["sol", "terra", "claude"]  # Runs from before Sol was dropped keep their panel.
 EFFORT = os.environ.get("MMR_EFFORT", "max")  # Default Codex effort; a run's own choice wins.
@@ -244,7 +246,7 @@ def reviewer_status(rd, who):
     done = attempts(rd, who)
     if done:
         return done[-1]["status"]
-    if who != "claude" and list(rd.glob(f"{who}.a*.pid")):
+    if who in MODELS and list(rd.glob(f"{who}.a*.pid")):
         return "running"
     return "not started"
 
@@ -302,9 +304,9 @@ def parse_spec(text):
                 raise ValueError(f"{tok}: Use rounds:<1-{HARD_STOP}>, like rounds:12.")
             rounds = int(parts[0])
             continue
-        who = "claude" if name == "opus" else name
+        who = "opus" if name == "claude" else name
         if who not in ALL_REVIEWERS:
-            raise ValueError(f"{tok}: Unknown reviewer. Use terra, astra, sol, luna or opus.")
+            raise ValueError(f"{tok}: Unknown reviewer. Use {', '.join(ALL_REVIEWERS)}.")
         if who in reviewers:
             raise ValueError(f"{tok}: {name} is listed twice.")
         reviewers.append(who)
@@ -326,7 +328,7 @@ def parse_spec(text):
 
 
 def spec_text(reviewers, effort, fast, rounds):
-    return " ".join(("opus" if r == "claude" else r) + f":{effort[r]}" + (":fast" if r in fast else "")
+    return " ".join(r + f":{effort[r]}" + (":fast" if r in fast else "")
                     for r in reviewers) + f" rounds:{rounds}"
 
 
@@ -382,7 +384,8 @@ def cmd_picker(a):
 
 def init_flags(a):
     """The older flag form, kept for scripts and tests: --reviewers, --effort, --fast, --max-rounds."""
-    reviewers = list(dict.fromkeys(r.strip() for r in a.reviewers.split(",") if r.strip()))
+    reviewers = list(dict.fromkeys("opus" if r.strip() == "claude" else r.strip()
+                                   for r in a.reviewers.split(",") if r.strip()))
     if not reviewers or set(reviewers) - set(ALL_REVIEWERS):
         die(f"--reviewers takes a comma-separated list from: {', '.join(ALL_REVIEWERS)}")
     if not 1 <= a.max_rounds <= HARD_STOP:
@@ -396,11 +399,12 @@ def init_flags(a):
             die(f"--fast takes on, off, or a comma-separated list of this run's Codex reviewers: {', '.join(codex)}")
     effort = {r: EFFORT if r in MODELS else CLAUDE_EFFORT for r in reviewers}
     for item in filter(None, (i.strip() for i in (a.effort or "").split(","))):
-        who, _, level = item.partition("=")
-        if who.strip() not in reviewers or level.strip() not in EFFORTS:
+        who, _, level = (part.strip() for part in item.partition("="))
+        who = "opus" if who == "claude" else who
+        if who not in reviewers or level not in EFFORTS:
             die(f"--effort takes reviewer=level pairs for this run's reviewers ({', '.join(reviewers)}), "
                 f"with levels {', '.join(EFFORTS)}. Got: {item}")
-        effort[who.strip()] = level.strip()
+        effort[who] = level
     return reviewers, effort, fast, a.max_rounds
 
 
@@ -582,10 +586,12 @@ def cmd_next(a):
         phases[phase] = "open"
     save(run, s)
     print(f"Round {n}: {phase} phase round {pr}, {scope} range {start[:12]}..{head[:12]}")
-    print(f"Prompt: {rd / 'prompt.md'}\nClaude answer file: {rd / 'claude.answer.md'}")
+    print(f"Prompt: {rd / 'prompt.md'}")
     print(settings_line(s))
-    if "claude" in panel(s):
-        print(f"Claude Agent effort: {effort_for(s, 'claude')}")
+    for who in panel(s):
+        if who in AGENT_MODEL:
+            print(f"Claude Agent {who}: model {AGENT_MODEL[who]}, effort {effort_for(s, who)}, "
+                  f"answer file {rd / (who + '.answer.md')}")
     old_location_note(repo_root(a.repo), run)
 
 
@@ -721,14 +727,21 @@ def cmd_claude_result(a):
     run, s = load(a.repo)
     n = s["open_round"] or die("No open round.")
     rd = round_dir(run, n)
-    attempt = next_attempt_allowed(rd, "claude")
-    answer = Path(a.file) if a.file else rd / "claude.answer.md"
+    claude = [r for r in panel(s) if r in AGENT_MODEL]
+    if not claude:
+        die("This run has no Claude reviewer.")
+    who = a.reviewer or (claude[0] if len(claude) == 1 else
+                         die(f"Name the reviewer with --reviewer: {', '.join(claude)}"))
+    if who not in claude:
+        die(f"{who} isn't a Claude reviewer on this run. Use {', '.join(claude)}.")
+    attempt = next_attempt_allowed(rd, who)
+    answer = Path(a.file) if a.file else rd / f"{who}.answer.md"
     if not answer.exists():
         die(f"Answer file not found: {answer}")
-    final = rd / f"claude.a{attempt}.final.md"
+    final = rd / f"{who}.a{attempt}.final.md"
     shutil.copyfile(answer, final)
-    finish_attempt(rd, "claude", attempt, None, final,
-                   {"model": "opus", "effort": "high", "seconds": a.seconds, "ended_at": now()})
+    finish_attempt(rd, who, attempt, None, final,
+                   {"model": AGENT_MODEL[who], "effort": effort_for(s, who), "seconds": a.seconds, "ended_at": now()})
 
 
 def cmd_reread(a):
@@ -1035,7 +1048,7 @@ def main():
     c.add_argument("--allow-flagged", action="store_true")
     c.add_argument("--fast", default="on",
                    help="Codex priority (fast) tier: on, off, or the Codex reviewers that run fast (terra,luna)")
-    c.add_argument("--effort", help="Per-reviewer effort, such as terra=max,claude=high")
+    c.add_argument("--effort", help="Per-reviewer effort, such as terra=max,opus=high")
     c.add_argument("--reviewers", default=",".join(REVIEWERS))
     c.add_argument("--max-rounds", type=int, default=HARD_STOP)
     c.add_argument("--spec", help='Typed options, such as "terra:max:fast opus:xhigh rounds:26"; replaces the flags above')
@@ -1057,11 +1070,12 @@ def main():
             c.add_argument("--standard-tier", action="store_true", help="Leave out the priority (fast) service tier")
         c.set_defaults(fn=fn)
     c = sub.add_parser("claude-result")
+    c.add_argument("--reviewer", choices=list(AGENT_MODEL), help="Needed when the run has 2+ Claude reviewers")
     c.add_argument("--seconds", type=float, required=True)
     c.add_argument("--file")
     c.set_defaults(fn=cmd_claude_result)
     c = sub.add_parser("reread")
-    c.add_argument("--reviewer", required=True, choices=ALL_REVIEWERS)
+    c.add_argument("--reviewer", required=True, choices=ALL_REVIEWERS + ["claude"])
     c.set_defaults(fn=cmd_reread)
     c = sub.add_parser("close")
     c.add_argument("--tests")

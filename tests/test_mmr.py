@@ -355,8 +355,11 @@ def main():
     def reviewers(n, terra="clean", claude="NO BLOCKING ISSUES."):
         modes.write_text(terra)
         check(mmr("codex", "--reviewer", "terra")[0] == (0 if terra != "bad" else 1), f"terra round {n}")
-        (rd(n) / "claude.answer.md").write_text(claude)
-        check(mmr("claude-result", "--seconds", "60")[0] == 0, f"claude round {n}")
+        # Older runs call their Opus reviewer "claude".
+        who = "claude" if "claude" in json.loads((run_dir() / "run.json").read_text()).get(
+            "reviewers", ["claude"]) else "opus"
+        (rd(n) / f"{who}.answer.md").write_text(claude)
+        check(mmr("claude-result", "--seconds", "60")[0] == 0, f"{who} round {n}")
 
     intent = tmp / "intent.md"
     intent.write_text("Make a.txt say two.\n")
@@ -414,7 +417,7 @@ def main():
     check("R1-1 a.txt:1: a.txt: Use three" in (rd(2) / "prompt.md").read_text(), "fix list in prompt")
     reviewers(2, terra="finding", claude="[P1] a.txt:1 | x -> y | Do z.")
     (rd(2) / "triage.tsv").write_text(
-        HEADER + "terra,claude\tP1\ta.txt:1\taccepted\tStill wrong\ta.txt: Use four\n")
+        HEADER + "terra,opus\tP1\ta.txt:1\taccepted\tStill wrong\ta.txt: Use four\n")
     commit("four\n", "WIP multimodel-review round 2")
     check(mmr("close", "--tests", "make test")[0] == 0, "close round 2")
 
@@ -642,7 +645,7 @@ def main():
     check(code == 1 and "--fast" in out, "fast mode refused for an unchosen reviewer")
     code, out = mmr("init", "--base", "main", "--intent-file", str(intent), "--new",
                     "--reviewers", "terra,claude,astra", "--fast", "astra", "--max-rounds", "6")
-    check(code == 0 and "Reviewers terra (max, standard), claude (xhigh), astra (max, fast); round limit 6" in out,
+    check(code == 0 and "Reviewers terra (max, standard), opus (xhigh), astra (max, fast); round limit 6" in out,
           "per-model fast mode saved")
     check(mmr("next", "--phase", "code")[0] == 0, "per-model run round 1")
     modes.write_text("clean clean")
@@ -655,7 +658,7 @@ def main():
     mmr("stop", "--reason", "Next scenario.")
     code, out = mmr("init", "--base", "main", "--intent-file", str(intent), "--new",
                     "--reviewers", "terra,claude,sol", "--fast", "on")
-    check(code == 0 and "terra (max, fast), claude (xhigh), sol (max, fast)" in out,
+    check(code == 0 and "terra (max, fast), opus (xhigh), sol (max, fast)" in out,
           "fast on covers every Codex reviewer")
     check(mmr("next", "--phase", "code")[0] == 0, "fast-on run round 1")
     modes.write_text("clean clean")
@@ -675,10 +678,11 @@ def main():
     code, out = mmr("init", "--base", "main", "--intent-file", str(intent), "--new",
                     "--reviewers", "terra,claude,luna", "--effort", "terra=high, claude=xhigh",
                     "--fast", "luna")
-    check(code == 0 and "terra (high, standard), claude (xhigh), luna (max, fast)" in out, "efforts saved")
+    check(code == 0 and "terra (high, standard), opus (xhigh), luna (max, fast)" in out, "efforts saved")
     code, out = mmr("next", "--phase", "code")
-    check(code == 0 and "Claude Agent effort: xhigh" in out and "luna (max, fast)" in out,
-          "next prints the settings and Claude's effort")
+    check(code == 0 and "Claude Agent opus: model opus, effort xhigh, answer file " in out
+          and "opus.answer.md" in out and "luna (max, fast)" in out,
+          "next prints the settings and the Claude Agent's model and effort")
     modes.write_text("clean clean")
     mmr("codex", "--reviewer", "terra")
     flags = Path(str(modes) + ".args").read_text()
@@ -687,25 +691,26 @@ def main():
     flags = Path(str(modes) + ".args").read_text()
     check("-m gpt-6-luna" in flags and 'model_reasoning_effort="max"' in flags
           and 'service_tier="priority"' in flags, "Luna runs at max, fast")
-    run_dir = Path(mmr("status")[1].splitlines()[0].split("Run: ", 1)[1])
-    meta = json.loads((run_dir / "rounds" / "01" / "terra.a1.meta.json").read_text())
+    meta = json.loads((rd(1) / "terra.a1.meta.json").read_text())
     check(meta["effort"] == "high", "meta records the run's effort")
 
     # Typed options: name[:effort][:fast], fast only when asked, rounds optional.
     cases = {
-        "terra:max:fast opus:xhigh rounds:26": "Reviewers terra (max, fast), claude (xhigh); round limit 26",
-        "terra:fast opus": "Reviewers terra (max, fast), claude (xhigh); round limit 26",
+        "terra:max:fast opus:xhigh rounds:26": "Reviewers terra (max, fast), opus (xhigh); round limit 26",
+        "terra:fast opus": "Reviewers terra (max, fast), opus (xhigh); round limit 26",
         "terra:high astra:max": "Reviewers terra (high, standard), astra (max, standard); round limit 26",
-        "": "Reviewers terra (max, fast), claude (xhigh); round limit 26",
-        "rounds:6": "Reviewers terra (max, fast), claude (xhigh); round limit 6",
-        "Terra:MAX:Fast, Opus": "Reviewers terra (max, fast), claude (xhigh); round limit 26",
+        "": "Reviewers terra (max, fast), opus (xhigh); round limit 26",
+        "rounds:6": "Reviewers terra (max, fast), opus (xhigh); round limit 6",
+        "Terra:MAX:Fast, Opus": "Reviewers terra (max, fast), opus (xhigh); round limit 26",
         "terra:max opus:xhigh luna:low:fast rounds:6.": "luna (low, fast); round limit 6",
-        "luna:fast:medium claude:low": "Reviewers luna (medium, fast), claude (low); round limit 26",
+        "luna:fast:medium claude:low": "Reviewers luna (medium, fast), opus (low); round limit 26",
+        "terra fable:high sonnet haiku:low": "Reviewers terra (max, standard), fable (high), sonnet (xhigh), "
+                                             "haiku (low); round limit 26",
     }
     for spec, want in cases.items():
         code, out = mmr("options", spec)
         check(code == 0 and want in out, f"options parse: {spec!r}")
-    for spec in ("terra:maxx", "opus:fast", "terra terra", "rounds:0", "rounds:27", "rounds", "venus",
+    for spec in ("terra:maxx", "opus:fast", "fable:fast", "opus claude", "terra terra", "rounds:0", "rounds:27", "rounds", "venus",
                  "terra:max:high", "terra:fast:fast", "terra:", "pick terra"):
         code, out = mmr("options", spec)
         check(code == 1 and "Init:" not in out, f"options refused: {spec!r}")
@@ -718,8 +723,35 @@ def main():
     check(code == 1 and "Codex models only" in out, "init refuses a bad --spec")
     mmr("stop", "--reason", "Next scenario.")
     code, out = mmr("init", "--base", "main", "--intent-file", str(intent), "--new")
-    check(code == 0 and "Reviewers terra (max, fast), claude (xhigh); round limit 26" in out,
+    check(code == 0 and "Reviewers terra (max, fast), opus (xhigh); round limit 26" in out,
           "plain init uses the new defaults")
+
+    # Several Claude reviewers, each its own Agent model.
+    mmr("stop", "--reason", "Next scenario.")
+    code, out = mmr("init", "--base", "main", "--intent-file", str(intent), "--new",
+                    "--spec", "opus:high fable sonnet:low rounds:2")
+    check(code == 0 and "Reviewers opus (high), fable (xhigh), sonnet (low); round limit 2" in out,
+          "Claude-only panel saved")
+    code, out = mmr("next", "--phase", "code")
+    check(code == 0 and "Claude Agent opus: model opus, effort high" in out
+          and "Claude Agent fable: model fable, effort xhigh" in out
+          and "Claude Agent sonnet: model sonnet, effort low" in out, "next lists every Claude Agent")
+    for who in ("opus", "fable", "sonnet"):
+        (rd(1) / f"{who}.answer.md").write_text("NO BLOCKING ISSUES.")
+    code, out = mmr("claude-result", "--seconds", "30")
+    check(code == 1 and "--reviewer" in out, "2+ Claude reviewers need --reviewer")
+    code, out = mmr("claude-result", "--reviewer", "haiku", "--seconds", "30")
+    check(code == 1 and "isn't a Claude reviewer on this run" in out, "unchosen Claude reviewer refused")
+    check(mmr("claude-result", "--reviewer", "fable", "--seconds", "30")[0] == 0, "Fable result saved")
+    meta = json.loads((rd(1) / "fable.a1.meta.json").read_text())
+    check(meta["model"] == "fable" and meta["effort"] == "xhigh", "meta records Fable's model and effort")
+    code, out = mmr("barrier")
+    check(code != 0 and "opus" in out and "sonnet" in out, "barrier waits for every Claude reviewer")
+    mmr("claude-result", "--reviewer", "opus", "--seconds", "30")
+    mmr("claude-result", "--reviewer", "sonnet", "--seconds", "30")
+    check(mmr("barrier")[0] == 0, "barrier passes with every Claude answer")
+    check(mmr("close")[0] == 0, "Claude-only round closes")
+    check("| fable |" in mmr("report")[1], "report lists Fable")
 
     # Runs started in the same second get distinct folders.
     mmr("stop", "--reason", "Next scenario.")
