@@ -688,6 +688,8 @@ class Dater:
 
     def __init__(self, repo, base):
         self.repo, self.base, self.ancestor, self.trees = git_history(repo), base, {}, {}
+        # A finding may give an absolute path in the run's checkout or in the main repo.
+        self.roots = [str(r).rstrip("/") + "/" for r in (repo, self.repo) if r]
 
     def git(self, *args):
         try:
@@ -704,7 +706,9 @@ class Dater:
 
     def path_at(self, commit, path):
         """The path as the commit has it, also when a finding names only its end, like plan.rs."""
-        path = path.removeprefix("./").removeprefix(self.repo.rstrip("/") + "/")
+        path = path.removeprefix("./")
+        for root in self.roots:
+            path = path.removeprefix(root)
         r = self.git("cat-file", "-e", f"{commit}:{path}")
         if r and r.returncode == 0:
             return path
@@ -722,7 +726,7 @@ class Dater:
             r = self.git("blame", "--porcelain", "-L", f"{min(lo, last)},{last}", commit, "--", path) if last else None
         if not r or r.returncode:
             return []
-        return re.findall(r"^([0-9a-f]{40}) \d+ \d+", r.stdout, re.M)
+        return re.findall(r"^([0-9a-f]{40,64}) \d+ \d+", r.stdout, re.M)
 
     def age(self, loc, commit, sweep):
         m = LOC_PARTS_RE.search(loc or "")
@@ -906,12 +910,14 @@ def cmd_next(a):
         pd = rd / CROSS
         pd.mkdir()
         (pd / "diff.patch").write_text(slice_outline(names, slices))
+        across = ("A doc or comment in one slice that is false about code in another slice" if phase == "docs" else
+                  "A caller and callee changed in different slices, a changed contract, type, schema, config or "
+                  "file format that code in another slice relies on, removed or renamed code still used elsewhere, "
+                  "and ordering or shared state across modules")
         (pd / "prompt.md").write_text(prompt(pd / "diff.patch", (
             f"Cross-file pass. The round's diff is {size} KB, so it is split by folder into {len(names)} slices, "
-            "and other passes review each slice line by line. Look only for problems that cross slices: A caller "
-            "and callee changed in different slices, a changed contract, type, schema, config or file format "
-            "that code in another slice relies on, removed or renamed code still used elsewhere, and ordering "
-            "or shared state across modules. The diff file lists each slice's files with their hunk headers. "
+            f"and other passes review each slice line by line. Look only for problems that cross slices: {across}. "
+            "The diff file lists each slice's files with their hunk headers. "
             f"Read the whole diff ({rd / 'diff.patch'}) in parts as needed, and open any file for context. "
             f"Report {sev_label} only."), ["Slice: cross-file pass over every slice"]))
         lines.append(f"Slice {CROSS}: Every file's hunk headers, {kb(nbytes((pd / 'diff.patch').read_text()))} KB; "

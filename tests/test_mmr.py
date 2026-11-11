@@ -517,7 +517,12 @@ def sweep_tests(tmp, env, intent):
     check([mod.code_scope(run, {**old, "phase_rounds": {**old["phase_rounds"], "code": c}})[0] for c in (0, 1, 2, 5)]
           == ["full", "full", "delta", "delta"], "runs saved before sweeps keep rounds 1-2 full")
     gone = repo / ".claude" / "worktrees" / "gone"
-    check(mod.Dater(str(gone), s["base_commit"]).repo == str(repo), "a missing worktree reads the main repo")
+    dater = mod.Dater(str(gone), s["base_commit"])
+    check(dater.repo == str(repo), "a missing worktree reads the main repo")
+    head = g("rev-parse", "HEAD")
+    check(dater.age(f"{gone}/src/deep/f.txt:5", head, head) == "seen-in-full"
+          and dater.age(f"{repo}/src/deep/f.txt:1", head, None) == "before-branch",
+          "absolute paths in the checkout or the main repo are dated")
     (run / "rounds.tsv").write_text(saved)
 
     # Final checks the code since the last full sweep. Late P0s are fixed; late P1s are listed, not looped on.
