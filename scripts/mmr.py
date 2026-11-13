@@ -54,6 +54,11 @@ OLD_HARD_STOP = 18
 SLICE_OVER = int(os.environ.get("MMR_SLICE_OVER", str(60 * 1024)))
 SLICE_MAX = int(os.environ.get("MMR_SLICE_MAX", str(40 * 1024)))
 CROSS = "cross"
+# In a split round, Codex reviewers take the slices and the cross-file pass, and each Claude reviewer
+# takes one pass over the whole diff: A Claude pass costs about as much on a slice as on the whole
+# diff. MMR_CLAUDE_SLICES=1 gives every reviewer every slice again.
+WHOLE = "whole"
+CLAUDE_SLICES = os.environ.get("MMR_CLAUDE_SLICES") == "1"
 # Code sweeps the full diff again after each fix until a sweep finds no accepted P0/P1 on code an
 # earlier sweep reviewed, at most this many times; then delta rounds check the fixes.
 # Runs saved without it keep rounds 1-2 full.
@@ -199,6 +204,18 @@ def part_names(rd):
 def part_dirs(rd):
     """Where each pass keeps its prompt, diff and reviewer files: the round folder, or one folder per slice."""
     return [rd / name for name in part_names(rd)] or [rd]
+
+
+def pass_dirs(rd, who):
+    """The folders where a reviewer has a pass. A split round assigns its parts to reviewers;
+    rounds split before that give every reviewer every part."""
+    meta = rd / "round.json"
+    assign = read_json(meta).get("assign", {}) if meta.exists() else {}
+    return [rd / name for name in assign[who]] if who in assign else part_dirs(rd)
+
+
+def not_assigned(rd, who, pd):
+    die(f"{who} has no pass on {pd.name} in this round. Its passes: {', '.join(p.name for p in pass_dirs(rd, who))}.")
 
 
 def part_dir(rd, name):
@@ -922,11 +939,26 @@ def cmd_next(a):
             f"Report {sev_label} only."), ["Slice: cross-file pass over every slice"]))
         lines.append(f"Slice {CROSS}: Every file's hunk headers, {kb(nbytes((pd / 'diff.patch').read_text()))} KB; "
                      f"prompt {pd / 'prompt.md'}")
+        codex = [w for w in panel(s) if w in MODELS]
+        claude = [w for w in panel(s) if w in AGENT_MODEL]
+        whole = bool(codex and claude) and not CLAUDE_SLICES
+        if whole:
+            pd = rd / WHOLE
+            pd.mkdir()
+            shutil.copyfile(rd / "diff.patch", pd / "diff.patch")
+            (pd / "prompt.md").write_text(prompt(pd / "diff.patch", (
+                f"{scope_text(phase, scope, sev_label, sweep)} The round's diff is {size} KB. {' and '.join(codex)} "
+                f"review it in {len(names)} slices plus a cross-file pass, and you review the whole diff in one "
+                "pass. Read it in parts as needed, and open any file for context."), ["Slice: whole diff, one pass"]))
+            lines.append(f"Slice {WHOLE}: The whole diff, {size} KB, for {', '.join(claude)} only; "
+                         f"prompt {pd / 'prompt.md'}")
+            meta["assign"] = {**{w: names + [CROSS] for w in codex}, **{w: [WHOLE] for w in claude}}
+        meta["parts"] = names + [CROSS] + ([WHOLE] if whole else [])
         (rd / "prompt.md").write_text("\n".join([
             "# Multi-model review round (split)", "",
-            f"Round {n} is split into {len(names)} slices plus a cross-file pass. Each has its own prompt:", "",
-            *[f"- {name}: {rd / name / 'prompt.md'}" for name in names + [CROSS]], ""]))
-        meta["parts"] = names + [CROSS]
+            f"Round {n} is split into {len(names)} slices plus a cross-file pass"
+            + (", and Claude reviewers get one pass over the whole diff" if whole else "") + ". Each has its own prompt:", "",
+            *[f"- {name}: {rd / name / 'prompt.md'}" for name in meta["parts"]], ""]))
     else:
         (rd / "prompt.md").write_text(prompt(rd / "diff.patch", scope_text(phase, scope, sev_label, sweep)))
     if sweep:
@@ -942,17 +974,21 @@ def cmd_next(a):
           + (f". {why}." if why else ""))
     if names:
         print(f"Split: The {kb(nbytes(diff))} KB diff is {len(names)} slices of at most {kb(split['max'])} KB, "
-              "plus a cross-file pass. Every reviewer reviews every slice and the cross-file pass, in parallel.")
+              "plus a cross-file pass. " + (
+                  f"{', '.join(codex)} review every slice and the cross-file pass; {', '.join(claude)} review the "
+                  "whole diff once. All passes run in parallel." if whole else
+                  "Every reviewer reviews every slice and the cross-file pass, in parallel."))
         print("\n".join(lines))
     else:
         print(f"Prompt: {rd / 'prompt.md'}")
     print(settings_line(s))
     for who in panel(s):
+        mine = [pd.name for pd in pass_dirs(rd, who)] if names else []
         if who in MODELS and names:
-            print(f"Codex {who}: `mmr.py codex --reviewer {who}` runs all {len(names) + 1} passes at once, "
+            print(f"Codex {who}: `mmr.py codex --reviewer {who}` runs all {len(mine)} passes at once, "
                   f"and `mmr.py monitor --reviewer {who}` watches them all.")
         if who in AGENT_MODEL:
-            for name in names + [CROSS] if names else [None]:
+            for name in mine or [None]:
                 if name:
                     print(f"Claude Agent {who} {name}: model {AGENT_MODEL[who]}, effort {effort_for(s, who)}, "
                           f"prompt {rd / name / 'prompt.md'}, answer file {rd / name / (who + '.answer.md')}")
@@ -971,6 +1007,8 @@ def cmd_codex(a):
     if part_names(round_dir(run, n)) and not a.slice:
         codex_all_slices(a, round_dir(run, n), who)
     rd = part_dir(round_dir(run, n), a.slice)
+    if a.slice and rd not in pass_dirs(round_dir(run, n), who):
+        not_assigned(round_dir(run, n), who, rd)
     attempt = next_attempt_allowed(rd, who)
     log = rd / f"{who}.a{attempt}.jsonl"
     err = rd / f"{who}.a{attempt}.err"
@@ -1034,7 +1072,7 @@ def cmd_codex(a):
 def codex_all_slices(a, rd, who):
     """Run one Codex pass per slice of a split round, all at once. Each pass is a normal runner with
     its own PID, logs and limits; reruns name their slice."""
-    todo = [name for name in part_names(rd) if reviewer_status(rd / name, who) == "not started"]
+    todo = [pd.name for pd in pass_dirs(rd, who) if reviewer_status(pd, who) == "not started"]
     if not todo:
         die("Every slice has a run already. Rerun one slice with --slice <name>.")
     cmd = [sys.executable, str(Path(__file__).resolve()), "--repo", a.repo, "codex", "--reviewer", who,
@@ -1066,7 +1104,7 @@ def cmd_monitor(a):
     who = a.reviewer
     rd = round_dir(run, n)
     # A split round's monitor watches every slice unless one is named, one line per event.
-    dirs = [part_dir(rd, a.slice)] if a.slice or not part_names(rd) else part_dirs(rd)
+    dirs = [part_dir(rd, a.slice)] if a.slice or not part_names(rd) else pass_dirs(rd, who)
     watch, failed = [], False
     deadline = time.time() + 30
     while True:
@@ -1133,7 +1171,6 @@ def cmd_monitor(a):
 def cmd_claude_result(a):
     run, s = load(a.repo)
     n = s["open_round"] or die("No open round.")
-    rd = part_dir(round_dir(run, n), a.slice)
     claude = [r for r in panel(s) if r in AGENT_MODEL]
     if not claude:
         die("This run has no Claude reviewer.")
@@ -1141,6 +1178,11 @@ def cmd_claude_result(a):
                          die(f"Name the reviewer with --reviewer: {', '.join(claude)}"))
     if who not in claude:
         die(f"{who} isn't a Claude reviewer on this run. Use {', '.join(claude)}.")
+    # A reviewer with a single pass in a split round (the whole-diff pass) needs no --slice.
+    top_rd, mine = round_dir(run, n), pass_dirs(round_dir(run, n), who)
+    rd = part_dir(top_rd, a.slice or (mine[0].name if part_names(top_rd) and len(mine) == 1 else None))
+    if part_names(top_rd) and rd not in mine:
+        not_assigned(top_rd, who, rd)
     attempt = next_attempt_allowed(rd, who)
     answer = Path(a.file) if a.file else rd / f"{who}.answer.md"
     if not answer.exists():
@@ -1171,7 +1213,7 @@ def cmd_barrier(a):
     run, s = load(a.repo)
     n = s["open_round"] or die("No open round.")
     rd = round_dir(run, n)
-    statuses = {label(who, pd): reviewer_status(pd, who) for who in panel(s) for pd in part_dirs(rd)}
+    statuses = {label(who, pd): reviewer_status(pd, who) for who in panel(s) for pd in pass_dirs(rd, who)}
     for who, status in statuses.items():
         print(f"{who}: {status}")
     if all(status == "ok" for status in statuses.values()):
@@ -1192,6 +1234,8 @@ def write_answers(rd, reviewers):
     for pd in part_dirs(rd):
         body += [f"## {pd.name}", ""]
         for who in reviewers:
+            if pd not in pass_dirs(rd, who):
+                continue
             text = (pd / f"{who}.final.md").read_text().strip()
             body += [f"### {who}", "", text, ""]
             for sev, loc in parse_final(text)[1]:
@@ -1269,11 +1313,11 @@ def cmd_close(a):
     top = Path(s["repo"])
     rd = round_dir(run, n)
     for who in panel(s):
-        if any(reviewer_status(pd, who) != "ok" for pd in part_dirs(rd)):
+        if any(reviewer_status(pd, who) != "ok" for pd in pass_dirs(rd, who)):
             die("Barrier not passed. Run `mmr.py barrier`.")
     meta = read_json(rd / "round.json")
     phase = meta["phase"]
-    raised = {who: sum(len(parse_final((pd / f"{who}.final.md").read_text())[1]) for pd in part_dirs(rd))
+    raised = {who: sum(len(parse_final((pd / f"{who}.final.md").read_text())[1]) for pd in pass_dirs(rd, who))
               for who in panel(s)}
     rows = merge_duplicates(read_triage(rd, raised))
     for row in rows:
@@ -1384,7 +1428,7 @@ def cmd_status(a):
         print(f"Open round: {s['open_round']} ({read_json(rd / 'round.json')['phase']})"
               + (f", split into {', '.join(parts)}" if parts else ""))
         for who in panel(s):
-            for pd in part_dirs(rd):
+            for pd in pass_dirs(rd, who):
                 print(f"  {label(who, pd)}: {reviewer_status(pd, who)}")
 
 
@@ -1433,7 +1477,7 @@ def reviewer_stats(run, s):
         st = {"raised": 0, "p01": 0, "p2": 0, "accepted": 0, "rejected": 0, "unique": 0,
               "unique_accepted_p01": 0, "clean_rounds": 0, "minutes": []}
         for n in range(1, s["rounds"] + 1):
-            finals = [pd / f"{who}.final.md" for pd in part_dirs(round_dir(run, n))]
+            finals = [pd / f"{who}.final.md" for pd in pass_dirs(round_dir(run, n), who)]
             finals = [f for f in finals if f.exists()]
             found = [item for f in finals for item in parse_final(f.read_text())[1]]
             st["raised"] += len(found)
@@ -1441,7 +1485,7 @@ def reviewer_stats(run, s):
             st["p2"] += sum(sev == "P2" for sev, _ in found)
             st["clean_rounds"] += bool(finals) and not found
             # A split round's passes run in parallel, so its time is its longest pass.
-            seconds = [float(good[-1]["seconds"]) for pd in part_dirs(round_dir(run, n))
+            seconds = [float(good[-1]["seconds"]) for pd in pass_dirs(round_dir(run, n), who)
                        for good in [[m for m in attempts(pd, who) if m["status"] == "ok"]]
                        if good and good[-1].get("seconds")]
             if seconds:
@@ -1654,7 +1698,7 @@ def main():
     c.add_argument("--phase", required=True, choices=["code", "docs", "final", "evidence"])
     c.add_argument("--note")
     c.set_defaults(fn=cmd_next)
-    slice_help = "In a split round: the slice (s1, s2, ... or cross)"
+    slice_help = "In a split round: the part (s1, s2, ..., cross or whole)"
     for name, fn in (("codex", cmd_codex), ("monitor", cmd_monitor)):
         c = sub.add_parser(name)
         c.add_argument("--reviewer", required=True, choices=list(MODELS))

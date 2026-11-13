@@ -346,7 +346,8 @@ def slice_tests(tmp, env, intent):
     run = latest_run(repo, env)
     check(json.loads((run / "run.json").read_text())["slices"] == {"over": 2000, "max": 1500},
           "the run keeps its split sizes")
-    code, out = mmr("next", "--phase", "code")
+    # MMR_CLAUDE_SLICES=1: Every reviewer reviews every slice, as before the whole-diff pass.
+    code, out = mmr("next", "--phase", "code", e={**env, "MMR_CLAUDE_SLICES": "1"})
     rd = run / "rounds" / "01"
     parts = json.loads((rd / "round.json").read_text()).get("parts", [])
     check(code == 0 and "Split:" in out and len(parts) >= 3 and parts[-1] == "cross", "big full round is split")
@@ -395,6 +396,57 @@ def slice_tests(tmp, env, intent):
     check(len(rows) == 1 and rows[0][3] == "terra,opus", "duplicate rows merge into one finding")
     report = mmr("report")[1]
     check("| terra | 1 |" in report and "| opus | 1 |" in report, "report counts findings across slices")
+
+    # By default a split round gives Codex the slices and each Claude reviewer one whole-diff pass.
+    mmr("stop", "--reason", "Next scenario.")
+    check(mmr("init", "--base", "main", "--intent-file", str(intent), "--new", e=small)[0] == 0, "whole-pass run")
+    run = latest_run(repo, env)
+    code, out = mmr("next", "--phase", "code")
+    rd = run / "rounds" / "01"
+    meta = json.loads((rd / "round.json").read_text())
+    mine = [p for p in meta.get("parts", []) if p != "whole"]
+    check(code == 0 and meta.get("parts", [])[-1:] == ["whole"] and mine[-1:] == ["cross"]
+          and meta.get("assign") == {"terra": mine, "opus": ["whole"]}, "Codex gets the slices, Claude the whole diff")
+    whole = (rd / "whole" / "prompt.md").read_text()
+    check((rd / "whole" / "diff.patch").read_text() == (rd / "diff.patch").read_text()
+          and "Slice: whole diff, one pass" in whole and f"terra review it in {len(mine) - 1} slices" in whole,
+          "the whole pass gets the whole diff")
+    check("Claude Agent opus whole: model opus" in out and "Claude Agent opus s1" not in out
+          and f"runs all {len(mine)} passes" in out, "next lists one Claude Agent")
+    code, out = mmr("codex", "--reviewer", "terra", "--slice", "whole")
+    check(code == 1 and "terra has no pass on whole" in out, "Codex can't take the whole pass")
+    code, out = mmr("codex", "--reviewer", "terra")
+    check(code == 0 and f"{len(mine)} of {len(mine)} slice passes ok" in out, "Codex runs only its own passes")
+    code, out = mmr("monitor", "--reviewer", "terra")
+    check(code == 0 and "FINISHED terra cross: ok" in out and "terra whole" not in out,
+          "the monitor watches only terra's passes")
+    (rd / "whole" / "opus.answer.md").write_text("[P1] a.txt:1 | x -> y | Fix.")
+    (rd / "s1" / "opus.answer.md").write_text("NO BLOCKING ISSUES.")
+    code, out = mmr("claude-result", "--slice", "s1", "--seconds", "30")
+    check(code == 1 and "opus has no pass on s1" in out, "Claude can't answer for a slice")
+    check(mmr("barrier")[0] == 1, "barrier waits for the whole pass")
+    check(mmr("claude-result", "--seconds", "30")[0] == 0, "the whole pass needs no --slice")
+    code, out = mmr("barrier")
+    check(code == 0 and "opus whole: ok" in out and "opus s1" not in out and "terra whole" not in out,
+          "barrier checks only assigned passes")
+    before_whole, _, after_whole = (rd / "answers.md").read_text().partition("## whole")
+    check("### opus" in after_whole and "### opus" not in before_whole and "### terra" in before_whole,
+          "answers list each pass under its part")
+    code, out = mmr("status")
+    check("opus whole: ok" in out and "opus s1" not in out, "status lists only assigned passes")
+    (rd / "triage.tsv").write_text(HEADER + "opus\tP1\ta.txt:1\trejected\tNot real\tGuarded: a.txt:1\n")
+    check(mmr("close")[0] == 0, "whole-pass round closes")
+    check("| opus | 1 |" in mmr("report")[1], "report counts the whole pass")
+
+    # A panel with only Codex reviewers has no whole pass.
+    mmr("stop", "--reason", "Next scenario.")
+    check(mmr("init", "--base", "main", "--intent-file", str(intent), "--new", "--spec", "terra", e=small)[0] == 0,
+          "Codex-only split run")
+    run = latest_run(repo, env)
+    code, out = mmr("next", "--phase", "code")
+    meta = json.loads((run / "rounds" / "01" / "round.json").read_text())
+    check(code == 0 and meta.get("parts", [])[-1:] == ["cross"] and "assign" not in meta,
+          "no whole pass without a Claude reviewer")
 
     # A failed slice: the monitor reports it and the rest, and only that slice reruns.
     mmr("stop", "--reason", "Next scenario.")
