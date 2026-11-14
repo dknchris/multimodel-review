@@ -30,6 +30,9 @@ if mode == "hang":
     time.sleep(600)
 if mode == "crash":
     sys.exit(7)
+if mode == "slow":
+    time.sleep(4)
+    mode = "clean"
 answer = {"clean": "NO BLOCKING ISSUES.",
           "finding": "[P1] a.txt:1 | Input x -> wrong y | Fix the thing.",
           "late-crash": "[P1] a.txt:1 | x -> y | Fix.",
@@ -492,6 +495,8 @@ def slice_tests(tmp, env, intent):
     code, out = mmr("monitor", "--reviewer", "terra")
     check(code == 1 and "FAILED terra s1: crash" in out and "FINISHED terra s2: ok" in out,
           "the monitor reports the failed slice and the finished ones")
+    check(out.index("FAILED terra s1") < out.index("FINISHED terra s2"),
+          "a failure is reported at once, and finished slices come together after it")
     code, out = mmr("barrier")
     check(code == 1 and "terra s1: crash" in out, "barrier names the failed slice")
     code, out = mmr("codex", "--reviewer", "terra", "--slice", "s1")
@@ -818,9 +823,19 @@ def handoff_tests(tmp, env, intent):
           and "branch feature" in brief, "handoff writes a brief a fresh session can follow")
     check(f"check that your working folder is {state['repo']}" in brief and "call EnterWorktree with that path" in brief,
           "a session started in another worktree enters the review checkout before any work")
+    check("You own this run until it's done" in brief and "the squash, the push and a PR" in brief
+          and "The session that started you does nothing more on the run" in brief,
+          "the brief gives the review session every decision on the run")
     skill = (Path(MMR).resolve().parent.parent / "SKILL.md").read_text()
-    check('`use_worktree: false`' in skill and '`context: "fresh"`' in skill,
-          "SKILL.md hands off in the same checkout, with no new worktree")
+    handoff = skill.split("## Hand-off")[1].split("## Fixer rules")[0]
+    check('`use_worktree: false`' in handoff and '`context: "fresh"`' in handoff
+          and '`initiation: "user_asked"`' in handoff and '`effort: "high"`' in handoff,
+          "SKILL.md starts the fresh session directly, in the same checkout, branch and PR")
+    check("Ask with buttons (AskUserQuestion)" in handoff and "Never use a session offer card" in handoff
+          and "call again without that one setting" in handoff,
+          "SKILL.md asks with buttons, never an offer card that drops settings")
+    check("Ask the owner nothing about the run, and send the review session nothing" in handoff
+          and "at most one line" in handoff, "the starting session stays out of a handed-off run")
     handoffs = json.loads((run / "run.json").read_text())["handoffs"]
     check([h["after_round"] for h in handoffs] == [2], "the hand-off is counted")
     out = mmr("status")[1]
@@ -844,6 +859,102 @@ def handoff_tests(tmp, env, intent):
     check(mmr("archive")[0] == 0, "archive")
     code, out = mmr("handoff")
     check(code == 1 and "finished" in out, "a finished run has nothing to hand off")
+
+
+def wake_and_docs_tests(tmp, env, intent):
+    """The monitor ends within seconds of its runner, a last-round docs fix gets one more Docs round from the
+    spare rounds, and a triage row without a severity records no finding."""
+    repo = tmp / "wake-docs"
+    repo.mkdir()
+    modes = Path(env["FAKE_MODE_FILE"])
+
+    def g(*args):
+        subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t.t", *args], cwd=repo, capture_output=True)
+
+    def mmr(*args, extra=None):
+        r = subprocess.run([sys.executable, MMR, "--repo", str(repo), *args], capture_output=True,
+                           text=True, env={**env, **GIT_ID, **(extra or {})}, timeout=90)
+        return r.returncode, r.stdout + r.stderr
+
+    def answers(n, terra):
+        modes.write_text(terra)
+        mmr("codex", "--reviewer", "terra")
+        (latest_run(repo, env) / "rounds" / f"{n:02d}" / "opus.answer.md").write_text("NO BLOCKING ISSUES.")
+        mmr("claude-result", "--seconds", "1")
+
+    def docs_round(n, text, rows):
+        check(mmr("next", "--phase", "docs")[0] == 0, f"docs round {n}")
+        answers(n, "finding")
+        (latest_run(repo, env) / "rounds" / f"{n:02d}" / "triage.tsv").write_text(HEADER + rows)
+        if text:
+            (repo / "a.txt").write_text(text + "\n")
+            g("commit", "-qam", f"WIP round {n}")
+        return mmr("close", "--tests", "none: docs only")
+
+    def to_docs():
+        """Round 1: A clean Code sweep, then Cleanup."""
+        check(mmr("next", "--phase", "code")[0] == 0, "wake-docs round 1")
+        return latest_run(repo, env)
+
+    (repo / "a.txt").write_text("one\n")
+    g("init", "-q", "-b", "main")
+    g("add", "-A")
+    g("commit", "-qm", "one")
+    g("checkout", "-qb", "feature")
+    (repo / "a.txt").write_text("two\n")
+    g("commit", "-qam", "two")
+    check(mmr("init", "--base", "main", "--intent-file", str(intent))[0] == 0, "wake-docs run")
+    run = to_docs()
+
+    # A reading is a minute apart, but the monitor still ends within seconds of its runner.
+    modes.write_text("slow")
+    began = time.time()
+    runner = subprocess.Popen([sys.executable, MMR, "--repo", str(repo), "codex", "--reviewer", "terra"],
+                              env={**env, **GIT_ID}, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    mon = subprocess.run([sys.executable, MMR, "--repo", str(repo), "monitor", "--reviewer", "terra"],
+                         env={**env, "MMR_TICK_SECONDS": "60", "MMR_QUIET_SECONDS": "120"},
+                         capture_output=True, text=True, timeout=90)
+    runner.wait(timeout=30)
+    took = time.time() - began
+    check(mon.returncode == 0 and "FINISHED terra: ok" in mon.stdout and took < 15,
+          f"the monitor ends within seconds of its runner, not a reading later ({took:.0f} s)")
+    (run / "rounds" / "01" / "opus.answer.md").write_text("NO BLOCKING ISSUES.")
+    mmr("claude-result", "--seconds", "1")
+    check("Code converged" in mmr("close")[1], "wake-docs Code converges")
+    (run / "cleanup.md").write_text("Nothing.\n")
+
+    # Docs round 1: a row without a severity is answered, with no finding recorded.
+    code, out = docs_round(2, "three", "terra\tP2\ta.txt:1\taccepted\tStale line\ta.txt: Say three\n"
+                                       "opus\t-\t-\trejected\tNO BLOCKING ISSUES\tNo finding raised\n")
+    check(code == 0 and "1 row(s) without a severity" in out, "a row without a severity is accepted")
+    check("NO BLOCKING ISSUES" not in (run / "findings.tsv").read_text(), "it records no finding")
+
+    # Docs round 2 is the last one, but its fix gets one more Docs round from the spare rounds.
+    code, out = docs_round(3, "four", "terra\tP2\ta.txt:1\taccepted\tStill stale\ta.txt: Say four\n")
+    check(code == 0 and "one more Docs round, from the spare rounds" in out
+          and out.rstrip().endswith("Next: mmr.py next --phase docs"), "a last-round docs fix gets one more round")
+    check(json.loads((run / "run.json").read_text())["docs_extra"] == 1, "the extra Docs round is stored")
+    code, out = docs_round(4, "", "terra\tP2\ta.txt:1\taccepted\tOne more\ta.txt: Say five\n")
+    check(code == 1 and "unreviewed" in out, "the extra Docs round is given only once")
+    (run / "rounds" / "04" / "triage.tsv").write_text(HEADER + "terra\tP2\ta.txt:1\topen\tOne more\tLeft for later\n")
+    code, out = mmr("close")
+    check(code == 0 and "Docs finished. Next: mmr.py next --phase final" in out, "Docs ends after the extra round")
+    check(mmr("next", "--phase", "docs")[0] == 1, "no Docs round after that")
+
+    # With no room for Final after it, the last Docs round keeps refusing a fix.
+    mmr("stop", "--reason", "Next scenario.")
+    check(mmr("init", "--base", "main", "--intent-file", str(intent), "--new")[0] == 0, "tight run")
+    run = latest_run(repo, env)
+    state = json.loads((run / "run.json").read_text())
+    state["max_rounds"] = 5
+    (run / "run.json").write_text(json.dumps(state))
+    to_docs()
+    answers(1, "clean")
+    check("Code converged" in mmr("close")[1], "tight run Code converges")
+    (run / "cleanup.md").write_text("Nothing.\n")
+    check(docs_round(2, "six", "terra\tP2\ta.txt:1\taccepted\tStale\ta.txt: Say six\n")[0] == 0, "tight docs 1")
+    code, out = docs_round(3, "seven", "terra\tP2\ta.txt:1\taccepted\tStale\ta.txt: Say seven\n")
+    check(code == 1 and "unreviewed" in out, "no extra Docs round when Final wouldn't fit")
 
 
 def legacy_findings_tests(tmp, env, intent):
@@ -1027,6 +1138,7 @@ def main():
     slice_tests(tmp, env, intent)
     sweep_tests(tmp, env, intent)
     handoff_tests(tmp, env, intent)
+    wake_and_docs_tests(tmp, env, intent)
     legacy_findings_tests(tmp, env, intent)
 
     sh("git", "init", "-q", "-b", "main")

@@ -39,6 +39,7 @@ CODEX = os.environ.get("MMR_CODEX_BIN", "codex")
 CAP_SECONDS = int(os.environ.get("MMR_CAP_SECONDS", "3600"))
 SILENCE_SECONDS = int(os.environ.get("MMR_SILENCE_SECONDS", "600"))
 TICK_SECONDS = int(os.environ.get("MMR_TICK_SECONDS", "60"))
+EXIT_CHECK_SECONDS = float(os.environ.get("MMR_EXIT_CHECK_SECONDS", "2"))  # Between readings: Has a runner exited?
 QUIET_SECONDS = int(os.environ.get("MMR_QUIET_SECONDS", "240"))
 MONITOR_CAP_SECONDS = int(os.environ.get("MMR_MONITOR_CAP_SECONDS", str(28 * 60)))
 MAX_ATTEMPTS = 2
@@ -152,6 +153,11 @@ def panel(s):
 
 def max_rounds(s):
     return s.get("max_rounds", OLD_HARD_STOP)
+
+
+def phase_cap(s, phase):
+    """A phase's cap, plus the one Docs round a last-round docs fix may take from the spare rounds."""
+    return caps(s)[phase] + (s.get("docs_extra", 0) if phase == "docs" else 0)
 
 
 def caps(s):
@@ -676,8 +682,8 @@ def cmd_init(a):
     (root / "latest").write_text(name + "\n")
     print(f"Run: {run}\nBranch: {branch}\nBase: {base} at {merge_base[:12]}\n"
           f"{settings_line(read_json(run / 'run.json'))}\n"
-          "Hand-off: Unless this review is this session's first task, run mmr.py handoff and offer a fresh "
-          "session now (SKILL.md, Hand-off).\nNext: mmr.py next --phase code")
+          "Hand-off: Unless this review is this session's first task, run mmr.py handoff and ask the owner "
+          "about a fresh session now (SKILL.md, Hand-off).\nNext: mmr.py next --phase code")
 
 
 def read_tsv(path):
@@ -872,8 +878,8 @@ def cmd_next(a):
             die("Pass --note with what the run showed and what changed.")
     if s["rounds"] >= max_rounds(s):
         die(f"Hard stop: {max_rounds(s)} rounds used. Stop and report.", 3)
-    if phase in caps(s) and s["phase_rounds"][phase] >= caps(s)[phase]:
-        die(f"{phase.capitalize()} cap reached ({caps(s)[phase]} rounds). Stop and report.", 3)
+    if phase in caps(s) and s["phase_rounds"][phase] >= phase_cap(s, phase):
+        die(f"{phase.capitalize()} cap reached ({phase_cap(s, phase)} rounds). Stop and report.", 3)
     require_clean(top, s.get("left_out", []))
     head = git(top, "rev-parse", "HEAD")
     n = s["rounds"] + 1
@@ -1149,8 +1155,20 @@ def pid_alive(pid):
     return bool(stat) and not stat.startswith("Z")
 
 
+def wait_for_exit(watch, seconds):
+    """Sleep until the next reading, but return as soon as a watched runner exits. The FINISHED line then
+    lands within seconds of the runner's own completion notice, in the same turn, instead of waking the
+    session a second time up to a reading later."""
+    end = time.time() + seconds
+    while time.time() < end:
+        time.sleep(max(0, min(EXIT_CHECK_SECONDS, end - time.time())))
+        if any(not pid_alive(w["pid"]) for w in watch):
+            return
+
+
 def cmd_monitor(a):
-    """One line per finish, failure or quiet stretch. Finished means the PID exited."""
+    """One line per failure or quiet stretch at once; FINISHED lines together once every watched pass has
+    ended, so a split round wakes the session once. Finished means the PID exited."""
     run, s = load(a.repo)
     n = s["open_round"] or die("No open round.")
     who = a.reviewer
@@ -1183,7 +1201,8 @@ def cmd_monitor(a):
     if not watch:
         sys.exit(1)
     started = time.time()
-    time.sleep(min(5, TICK_SECONDS))
+    done = []  # FINISHED lines, held until every watched pass has ended.
+    wait_for_exit(watch, min(5, TICK_SECONDS))
     while True:
         for w in list(watch):
             alive = pid_alive(w["pid"])
@@ -1201,14 +1220,19 @@ def cmd_monitor(a):
                     failed = True
                     continue
                 meta = read_json(w["meta"])
-                word = "FINISHED" if meta["status"] == "ok" else "FAILED"
-                failed = failed or meta["status"] != "ok"
-                print(f"{word} {w['label']}: {meta['status']}, {meta['findings']} finding(s), "
-                      f"{meta.get('seconds', 0) / 60:.1f} min.", flush=True)
+                line = (f"{w['label']}: {meta['status']}, {meta['findings']} finding(s), "
+                        f"{meta.get('seconds', 0) / 60:.1f} min.")
+                if meta["status"] == "ok":
+                    done.append(f"FINISHED {line}")
+                else:
+                    failed = True
+                    print(f"FAILED {line}", flush=True)
             elif quiet >= QUIET_SECONDS and not w["warned"]:
                 print(f"QUIET {w['label']}: No output for {int(quiet / 60)} min; process alive. "
                       f"Normal at max effort; it stops at {SILENCE_SECONDS // 60} silent minutes.", flush=True)
                 w["warned"] = True
+        if done and (not watch or time.time() - started >= MONITOR_CAP_SECONDS):
+            print("\n".join(done), flush=True)
         if not watch:
             sys.exit(1 if failed else 0)
         if time.time() - started >= MONITOR_CAP_SECONDS:
@@ -1217,7 +1241,7 @@ def cmd_monitor(a):
                 print(f"RE-ARM {w['label']}: Still running at the monitor cap; start the monitor again{again}.",
                       flush=True)
             sys.exit(0)
-        time.sleep(TICK_SECONDS)
+        wait_for_exit(watch, TICK_SECONDS)
 
 
 def cmd_claude_result(a):
@@ -1338,7 +1362,7 @@ def read_triage(rd, raised):
     lines = [ln for ln in path.read_text().splitlines() if ln.strip()]
     if not lines or lines[0].split("\t") != TRIAGE_HEADER:
         die("triage.tsv must start with this tab-separated header: " + " ".join(TRIAGE_HEADER))
-    rows = []
+    rows, empty = [], []
     for ln in lines[1:]:
         cells = ln.split("\t")
         if len(cells) != len(TRIAGE_HEADER):
@@ -1347,6 +1371,10 @@ def read_triage(rd, raised):
         row["reviewers"] = [r for r in row["reviewers"].split(",") if r]
         if not row["reviewers"] or set(row["reviewers"]) - set(raised):
             die(f"Bad reviewers: {ln[:120]}")
+        if row["sev"] in ("", "-"):
+            # An answer that raises nothing: It counts as answered, and no finding is recorded.
+            empty.append(row)
+            continue
         if row["sev"] not in ("P0", "P1", "P2"):
             die(f"Bad severity: {ln[:120]}")
         if row["status"] not in ("accepted", "rejected", "open"):
@@ -1355,9 +1383,11 @@ def read_triage(rd, raised):
             die(f"Summary and note are required: {ln[:120]}")
         rows.append(row)
     for who, count in raised.items():
-        listed = sum(who in row["reviewers"] for row in rows)
+        listed = sum(who in row["reviewers"] for row in rows + empty)
         if count and not listed:
             die(f"{who} raised {count} finding(s) that are missing from triage.tsv.")
+    if empty:
+        print(f"{len(empty)} row(s) without a severity: Answered, with no finding recorded.")
     return rows
 
 
@@ -1394,7 +1424,13 @@ def cmd_close(a):
     rejected = [r for r in rows if r["status"] == "rejected"]
     held = [r for r in rows if r["status"] == "open" and all(r is not x for x in listed)]
     hard_last = n >= max_rounds(s)
-    phase_last = phase in caps(s) and meta["phase_round"] >= caps(s)[phase]
+    phase_last = phase in caps(s) and meta["phase_round"] >= phase_cap(s, phase)
+    # A docs fix in the last Docs round takes one spare round for its check, once, when Final still fits.
+    docs_extra = bool(accepted and phase == "docs" and phase_last and not hard_last and not s.get("docs_extra")
+                      and max_rounds(s) - n >= 1 + caps(s)["final"] - s["phase_rounds"]["final"])
+    if docs_extra:
+        s["docs_extra"] = 1
+        phase_last = False
     last = hard_last or phase_last
     if accepted and last:
         die("Last allowed round: a fix here would go unreviewed. Mark these findings open.")
@@ -1438,6 +1474,8 @@ def cmd_close(a):
         if clean or last:
             phases["docs"] = "converged" if clean else "ended"
             message = "Docs finished. Next: mmr.py next --phase final"
+        elif docs_extra:
+            message = "This docs fix gets one more Docs round, from the spare rounds. " + message
     elif phase == "final":
         if listed:
             message = (f"{len(listed)} late P1(s) listed for the report, not looped on. " + message)
@@ -1460,8 +1498,8 @@ def cmd_close(a):
         message = f"STOP: {s['stopped']} Next: Done steps."
     due = handoff_due(s)
     if due:
-        message = (f"Hand-off due: {due} rounds ran since the last hand-off. Run mmr.py handoff and offer a fresh "
-                   "session before the next step (SKILL.md, Hand-off). " + message)
+        message = (f"Hand-off due: {due} rounds ran since the last hand-off. Run mmr.py handoff and ask the owner "
+                   "about a fresh session before the next step (SKILL.md, Hand-off). " + message)
     save(run, s)
     ages = [row["age"] for row in rows]
     dated = ", ".join(f"{ages.count(age)} {age}" for age in AGES + ["unknown"] if age in ages)
@@ -1518,7 +1556,9 @@ def cmd_handoff(a):
         f"3. Work in {s['repo']} on branch {s['branch']}, and don't switch branches.",
         f"4. First check that your working folder is {s['repo']}. If it isn't, call EnterWorktree with that "
         "path before anything else, then check the folder and branch again. A hook blocks edits outside your "
-        "own folder, and change_directory can't move a session that runs in its own worktree.", "",
+        "own folder, and change_directory can't move a session that runs in its own worktree.",
+        "5. You own this run until it's done, including device or emulator checks, the squash, the push and "
+        "a PR: Ask the owner about them here. The session that started you does nothing more on the run.", "",
         f"Run folder: {run}",
         f"Intent: {run / 'intent.md'}",
         settings_line(s),

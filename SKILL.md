@@ -13,7 +13,7 @@ Independent reviewers read the same prompt at the same commit. This session is t
 
 ## Settings
 
-- Round caps: Code 20 to 50 (default 20; the picker's Standard, Long and Max are 20, 35 and 50), Docs 2, Final 2, plus 2 to 6 spare rounds for evidence rounds (default 2). Hard stop: Their sum, 26 by default. Each phase ends at its first clean round, so the caps are ceilings. Up to 4 Code rounds are full sweeps, and they count toward the Code cap. Older runs keep their own caps and limit.
+- Round caps: Code 20 to 50 (default 20; the picker's Standard, Long and Max are 20, 35 and 50), Docs 2, Final 2, plus 2 to 6 spare rounds for evidence rounds and a last-round docs fix (default 2). Hard stop: Their sum, 26 by default. Each phase ends at its first clean round, so the caps are ceilings. Up to 4 Code rounds are full sweeps, and they count toward the Code cap. Older runs keep their own caps and limit.
 - Reviewers: Terra (gpt-6.1-terra) and Opus (Opus 5.5) by default. Optional: Fable (Fable 5.2), Astra (gpt-6-astra), Sol (gpt-6.1-sol), Sonnet (Sonnet 5.5), Haiku (Haiku 5.5) and Luna (gpt-6-luna). Runs started before this change call their Opus reviewer `claude`.
 - Effort is set for each reviewer, per run: low, medium, high, xhigh or max. Defaults: Codex max, Claude models xhigh.
 - Default panel: `terra:max opus:xhigh code:20 spare:2`.
@@ -53,10 +53,10 @@ Below, `mmr <command>` is short for that full call.
    - Sweeps 2 on: From full Code sweep 2 on, only Codex reviewers review, when the panel has one. `next` prints `<name>: No pass this round` for each Claude reviewer instead of a `Claude Agent` line, so start no Agent for it. Delta, Docs and Final rounds have every reviewer. Runs started before this change keep every reviewer.
 2. Start every reviewer `mmr status` lists, in one message:
    - Each Codex reviewer (terra, astra, sol, luna): Bash with `run_in_background`: `mmr codex --reviewer <name>`. In a split round, this one call runs all of that reviewer's slices at once. The helper runs Codex with `-s read-only`, apps, plugins and subagents off, web search on, its own logs, and the time limits. Never use workspace-write or `--dangerously-bypass-approvals-and-sandbox`, the companion script, or the rescue subagent.
-   - One Monitor per Codex reviewer: `mmr monitor --reviewer <name>`, with `timeout_ms: 1800000`. In a split round it watches every slice and prints one line per slice event. It checks every 60 seconds and decides "finished" from the PID exiting, never from output text.
+   - One Monitor per Codex reviewer: `mmr monitor --reviewer <name>`, with `timeout_ms: 1800000`. In a split round it watches every slice. It writes a reading every 60 seconds and checks every 2 seconds whether a runner exited, so its FINISHED lines land in the same turn as the `mmr codex` call's own completion notice. It decides "finished" from the PID exiting, never from output text.
    - Each Claude reviewer (opus, fable, sonnet, haiku; `claude` in older runs): A fresh Agent with `subagent_type: "multimodel-reviewer"`, `model` and `effort` from its `Claude Agent` line, and the prompt "Review round file: <prompt path>". In a split round, start one Agent per `Claude Agent` line, each with its own part's prompt. That agent has read and web tools, but no shell or edit tools. If the type isn't available, use `Plan` with the same model and effort and tell it to use only Read, Grep and web search.
 3. Handle Monitor events:
-   - `FINISHED`: Nothing to do.
+   - `FINISHED`: Nothing to do. These lines come together once every pass the monitor watches has ended.
    - `FAILED`: Rerun as in step 5, and tell the owner in one line only if the rerun also fails.
    - `QUIET`: Not a failure, since high effort can think silently for minutes. Take no action; the helper stops a reviewer at 10 silent minutes.
    - `RE-ARM`: Start that monitor again, with the `--slice` the line names.
@@ -78,7 +78,7 @@ terra	P1	src/b.py:9	rejected	Null token crashes	Token is non-null: src/auth.py:3
 - `status` is `accepted`, `rejected`, or `open`. `open` is only for the last allowed round, where a fix would go unreviewed, and for a late P1 in Final.
 - `note` is what changed (accepted), the code-cited reason (rejected), or why it's left (open). Accepted and rejected notes feed the next prompt's fix list and ledger.
 - Reject out-of-phase findings as "Out of phase".
-- Reviewers can answer in any format, so read each answer yourself. Finding counts are a best guess. An answer with no P0/P1/P2 tags counts as one finding: Add a row for what it raises, or one `rejected` row if it raises nothing.
+- Reviewers can answer in any format, so read each answer yourself. Finding counts are a best guess. An answer with no P0/P1/P2 tags counts as one finding: Add a row for what it raises, or one row with `sev` set to `-` if it raises nothing. A "NO BLOCKING ISSUES." answer needs no row. `close` records no finding for a `-` row.
 
 WIP commits: Message `WIP multimodel-review round <N>`, written to a file and passed with `git commit -F`, plus the session's attribution lines. Never push.
 
@@ -90,7 +90,7 @@ WIP commits: Message `WIP multimodel-review round <N>`, written to a file and pa
    - Tests: Delete only debugging or scaffolding tests and tests for removed code. Keep regression tests.
    - Run the full test suite. If it fails, fix it; if you can't with a small fix, stop and report.
    - Commit, then Write `cleanup.md` in the run folder: Each deletion with its reason, and the exact test command and result. `next --phase docs` refuses without it.
-3. **Docs:** One full-diff round at P2, fix, then one delta round. Then the phase ends; anything left is recorded as open.
+3. **Docs:** One full-diff round at P2, fix, then one delta round. If that delta round accepts a docs fix, `close` gives it one more Docs round from the spare rounds, once, when Final still fits under the hard stop. Then the phase ends; anything left is recorded as open.
 4. **Final:** A check, not a fresh search. Round 1 reviews the code written since the last full Code sweep, plus its effects on callers, with all reviewers, P0/P1 only. If nothing changed since that sweep, `next` marks Final converged. A Final finding on code a full sweep already reviewed is tagged `late`, and the report counts them. Late P0s are always fixed. Late P1s get status `open` with a note: The report lists them, and they neither block Final nor loop. If another finding is accepted, fix it and run one delta round. If that still fails, mark it open; the helper stops the run. Runs started before this change keep a full Final round 1.
 
 ## Convergence
@@ -107,10 +107,13 @@ This session's context is most of a review's cost, because every step reads it a
 1. Hand off only between rounds: An open round's reviewers report to the session that started them, so `mmr handoff` refuses one.
 2. If the owner decided something in this session that the run folder doesn't hold, such as a path to leave alone or a pending device test, Write it to a scratchpad notes file.
 3. Run `mmr handoff`, adding `--notes <file>` if you wrote one. It saves a brief as `handoff.md` in the run folder, prints it, and counts the hand-off, so the next one is due 8 rounds later even if the owner stays here.
-4. Offer the fresh session:
-   - With a start_session tool (desktop app): Offer a session with title "Continue multimodel-review", on Opus 5.5 at high effort, with the brief, unchanged, as its prompt. The owner picks the new session or this one. On the call that carries the brief, pass `context: "fresh"` and `use_worktree: false`. Without `use_worktree: false`, a session that runs in a worktree gives the new session its own worktree, cut from the default branch. A hook then blocks every fix in the review checkout, where the run's commits are. If the app refuses `use_worktree: false`, don't hand off: Tell the owner in one line and continue here. If a fresh session still starts somewhere else, the brief has it enter the review checkout with EnterWorktree before any work.
-   - In a terminal: Ask with buttons: "Fresh session (Recommended)" or "Continue here". For a fresh session, tell the owner to type `/clear`, then `/multimodel-review`; the run resumes from disk.
-5. If the owner takes the fresh session, stop: This session does nothing more on the run, even when that session's notes arrive here. Otherwise continue from the `Next:` line.
+4. Ask with buttons (AskUserQuestion): "Fresh session (Recommended)" or "Continue here". Never use a session offer card (`initiation: "offer"`): Its brief call takes no settings, so the new session gets its own worktree, cut from the default branch, and any PR it opens is linked only to it.
+   - With a start_session tool (desktop app), on "Fresh session": Call start_session once with `initiation: "user_asked"`, `context: "fresh"`, `use_worktree: false`, `effort: "high"`, title "Continue multimodel-review", the brief, unchanged, as `prompt`, and as `background` a few sentences on what's under review and the owner's standing rules. With `use_worktree: false`, the new session shares this session's checkout, branch and PR. If the app refuses a setting, call again without that one setting. Without `use_worktree: false` (refused, for example, when this session entered its own worktree with EnterWorktree), the brief has the new session enter the review checkout with EnterWorktree before any work.
+   - In a terminal, on "Fresh session": Tell the owner to type `/clear`, then `/multimodel-review`; the run resumes from disk.
+5. If the owner takes the fresh session, this session is done with the run. The review session asks the owner its own questions, including device checks, the squash, the push and a PR. Here:
+   - Ask the owner nothing about the run, and send the review session nothing, even when its notes arrive.
+   - Answer its progress notes with at most one line. Only when it finishes, stops or waits for the owner, say so and link it.
+   Otherwise continue from the `Next:` line.
 
 Runs started before this change print no `Hand-off due`, but `mmr handoff` works on them too.
 
