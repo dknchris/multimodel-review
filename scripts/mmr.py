@@ -60,10 +60,17 @@ CROSS = "cross"
 # diff. MMR_CLAUDE_SLICES=1 gives every reviewer every slice again.
 WHOLE = "whole"
 CLAUDE_SLICES = os.environ.get("MMR_CLAUDE_SLICES") == "1"
-# Code sweeps the full diff again after each fix until a sweep finds no accepted P0/P1 on code an
-# earlier sweep reviewed, at most this many times; then delta rounds check the fixes.
-# Runs saved without it keep rounds 1-2 full.
+# Code sweeps the full diff again after each fix, at most FULL_SWEEPS times; then delta rounds check the fixes.
+# Sweep 2 always follows a non-clean sweep 1. After that, another sweep runs only if the last one accepted at
+# least SWEEP_MIN_OLD P0/P1 on old code: code an earlier sweep reviewed (seen-in-full) or older than the branch
+# (before-branch). Runs saved without "sweep_min_old" sweep again on 1 seen-in-full finding, and runs saved
+# without "full_sweeps" keep rounds 1-2 full.
 FULL_SWEEPS = 4
+SWEEP_MIN_OLD = 2
+OLD_CODE = ("seen-in-full", "before-branch")
+# From this sweep on, only Codex reviewers sweep when the panel has one: After sweep 1, a Claude pass costs
+# about $3.80 and found few bugs alone. Runs saved without "codex_sweeps_from" keep every reviewer.
+CODEX_SWEEPS_FROM = 2
 # How old a finding's code is, from git blame. Oldest first; "unknown" when blame can't place it.
 AGES = ["before-branch", "seen-in-full", "newer"]
 ALLOWED = {
@@ -653,7 +660,7 @@ def cmd_init(a):
         "start_head": head, "started_at": now(), "rounds": 0,
         "created_branch": created, "snapshot_commit": snapshot, "left_out": left_out,
         "slices": {"over": SLICE_OVER, "max": SLICE_MAX}, "full_sweeps": min(FULL_SWEEPS, run_caps["code"]),
-        "final_check": True,
+        "sweep_min_old": SWEEP_MIN_OLD, "codex_sweeps_from": CODEX_SWEEPS_FROM, "final_check": True,
         "phase_rounds": {"code": 0, "docs": 0, "final": 0, "evidence": 0},
         "phases": {"code": "pending", "docs": "pending", "final": "pending"},
         "open_round": None, "last_reviewed": None, "stopped": None, "finished": False,
@@ -765,10 +772,18 @@ def sweeps_before(run, n=None):
             if r["phase"] == "code" and r["scope"] == "full" and (n is None or int(r["round"]) < n)]
 
 
-def missed(run, n):
-    """Accepted P0/P1 of round n on code an earlier full sweep reviewed."""
+def missed(run, n, s=None):
+    """Accepted P0/P1 of round n on old code: code an earlier full sweep reviewed, plus code older than
+    the branch in runs saved with sweep_min_old."""
+    ages = OLD_CODE if s and s.get("sweep_min_old") else ("seen-in-full",)
     return [f for f in read_tsv(run / "findings.tsv") if f["round"] == str(n) and f["status"] == "accepted"
-            and f["sev"] in ("P0", "P1") and f.get("age") == "seen-in-full"]
+            and f["sev"] in ("P0", "P1") and f.get("age") in ages]
+
+
+def resting(s, sweep):
+    """Claude reviewers that sit out this full Code sweep: From codex_sweeps_from on, when the panel has Codex."""
+    start, codex = s.get("codex_sweeps_from"), [w for w in panel(s) if w in MODELS]
+    return [w for w in panel(s) if w in AGENT_MODEL] if start and sweep >= start and codex else []
 
 
 def code_scope(run, s):
@@ -788,7 +803,13 @@ def code_scope(run, s):
         return "delta", f"{done} full sweeps is the cap, so delta rounds check the fixes"
     if done == 1:
         return "full", "Full sweep 2, after sweep 1's fixes"
-    found = len(missed(run, code[-1]["round"]))
+    found, need = len(missed(run, code[-1]["round"], s)), s.get("sweep_min_old")
+    if need:
+        if found >= need:
+            return "full", (f"Full sweep {done + 1}: Sweep {done} found {found} accepted P0/P1 on old code "
+                            "(reviewed by an earlier sweep or older than the branch)")
+        return "delta", (f"Sweep {done} found {found} accepted P0/P1 on old code, under {need}, "
+                         "so delta rounds check the fixes")
     if found:
         return "full", f"Full sweep {done + 1}: Sweep {done} found {found} accepted P0/P1 on code an earlier sweep reviewed"
     return "delta", f"Sweep {done} found nothing new on code an earlier sweep reviewed, so delta rounds check the fixes"
@@ -903,6 +924,9 @@ def cmd_next(a):
     sweep = len(sweeps_before(run)) + 1 if phase == "code" and scope == "full" and s.get("full_sweeps") else 0
     again = (f"This is full sweep {sweep}: Earlier sweeps reviewed this code and still missed bugs, so read "
              "every change, not only the fixes. ") if sweep > 1 else ""
+    codex = [w for w in panel(s) if w in MODELS]
+    claude = [w for w in panel(s) if w in AGENT_MODEL]
+    rest = resting(s, sweep)
     split = s.get("slices")
     slices = plan_slices(diff, split["max"]) if scope == "full" and split and nbytes(diff) > split["over"] else []
     names = [f"s{i}" for i in range(1, len(slices) + 1)] if len(slices) > 1 else []
@@ -940,9 +964,7 @@ def cmd_next(a):
             f"Report {sev_label} only."), ["Slice: cross-file pass over every slice"]))
         lines.append(f"Slice {CROSS}: Every file's hunk headers, {kb(nbytes((pd / 'diff.patch').read_text()))} KB; "
                      f"prompt {pd / 'prompt.md'}")
-        codex = [w for w in panel(s) if w in MODELS]
-        claude = [w for w in panel(s) if w in AGENT_MODEL]
-        whole = bool(codex and claude) and not CLAUDE_SLICES
+        whole = bool(codex and claude) and not CLAUDE_SLICES and not rest
         if whole:
             pd = rd / WHOLE
             pd.mkdir()
@@ -962,6 +984,8 @@ def cmd_next(a):
             *[f"- {name}: {rd / name / 'prompt.md'}" for name in meta["parts"]], ""]))
     else:
         (rd / "prompt.md").write_text(prompt(rd / "diff.patch", scope_text(phase, scope, sev_label, sweep)))
+    if rest:  # Reviewers with no pass this round; the others keep every part.
+        meta["assign"] = {w: [] for w in rest}
     if sweep:
         meta["sweep"] = sweep
     write_json(rd / "round.json", meta)
@@ -978,12 +1002,17 @@ def cmd_next(a):
               "plus a cross-file pass. " + (
                   f"{', '.join(codex)} review every slice and the cross-file pass; {', '.join(claude)} review the "
                   "whole diff once. All passes run in parallel." if whole else
+                  f"{', '.join(codex)} review every slice and the cross-file pass, in parallel." if rest else
                   "Every reviewer reviews every slice and the cross-file pass, in parallel."))
         print("\n".join(lines))
     else:
         print(f"Prompt: {rd / 'prompt.md'}")
     print(settings_line(s))
     for who in panel(s):
+        if who in rest:
+            print(f"{who}: No pass this round. From full sweep {s['codex_sweeps_from']} on, only "
+                  f"{', '.join(codex)} sweep{'s' if len(codex) == 1 else ''}.")
+            continue
         mine = [pd.name for pd in pass_dirs(rd, who)] if names else []
         if who in MODELS and names:
             print(f"Codex {who}: `mmr.py codex --reviewer {who}` runs all {len(mine)} passes at once, "
@@ -1181,6 +1210,8 @@ def cmd_claude_result(a):
         die(f"{who} isn't a Claude reviewer on this run. Use {', '.join(claude)}.")
     # A reviewer with a single pass in a split round (the whole-diff pass) needs no --slice.
     top_rd, mine = round_dir(run, n), pass_dirs(round_dir(run, n), who)
+    if not mine:
+        die(f"{who} has no pass in this round: Only Codex reviewers review it.")
     rd = part_dir(top_rd, a.slice or (mine[0].name if part_names(top_rd) and len(mine) == 1 else None))
     if part_names(top_rd) and rd not in mine:
         not_assigned(top_rd, who, rd)
@@ -1319,7 +1350,7 @@ def cmd_close(a):
     meta = read_json(rd / "round.json")
     phase = meta["phase"]
     raised = {who: sum(len(parse_final((pd / f"{who}.final.md").read_text())[1]) for pd in pass_dirs(rd, who))
-              for who in panel(s)}
+              for who in panel(s) if pass_dirs(rd, who)}
     rows = merge_duplicates(read_triage(rd, raised))
     for row in rows:
         if row["status"] != "rejected" and row["sev"] not in ALLOWED[phase]:
@@ -1429,6 +1460,8 @@ def cmd_status(a):
         print(f"Open round: {s['open_round']} ({read_json(rd / 'round.json')['phase']})"
               + (f", split into {', '.join(parts)}" if parts else ""))
         for who in panel(s):
+            if not pass_dirs(rd, who):
+                print(f"  {who}: no pass this round")
             for pd in pass_dirs(rd, who):
                 print(f"  {label(who, pd)}: {reviewer_status(pd, who)}")
 
@@ -1509,9 +1542,10 @@ def sweep_lines(run, s):
     sweeps = sweeps_before(run)
     if not s.get("full_sweeps") or not sweeps:
         return []
-    found = [f"round {r['round']}: {len(missed(run, r['round']))}" for r in sweeps[1:]]
+    found = [f"round {r['round']}: {len(missed(run, r['round'], s))}" for r in sweeps[1:]]
+    old = "old code" if s.get("sweep_min_old") else "code an earlier sweep reviewed"
     return [f"Full Code sweeps: {len(sweeps)} (rounds {', '.join(r['round'] for r in sweeps)}"
-            + (f"). Accepted P0/P1 on code an earlier sweep reviewed: {', '.join(found)}" if found else ")")]
+            + (f"). Accepted P0/P1 on {old}: {', '.join(found)}" if found else ")")]
 
 
 def late_lines(run):

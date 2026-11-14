@@ -448,6 +448,35 @@ def slice_tests(tmp, env, intent):
     check(code == 0 and meta.get("parts", [])[-1:] == ["cross"] and "assign" not in meta,
           "no whole pass without a Claude reviewer")
 
+    # From full sweep 2 on, Codex reviewers take every slice and Claude reviewers sit out: No whole pass.
+    mmr("stop", "--reason", "Next scenario.")
+    check(mmr("init", "--base", "main", "--intent-file", str(intent), "--new", e=small)[0] == 0, "split sweep run")
+    run = latest_run(repo, env)
+    check(mmr("next", "--phase", "code")[0] == 0, "split sweep 1")
+    rd = run / "rounds" / "01"
+    modes.write_text("finding")
+    mmr("codex", "--reviewer", "terra", "--slice", "s1")
+    modes.write_text("")
+    mmr("codex", "--reviewer", "terra")
+    (rd / "whole" / "opus.answer.md").write_text("NO BLOCKING ISSUES.")
+    mmr("claude-result", "--seconds", "1")
+    (rd / "triage.tsv").write_text(HEADER + "terra\tP1\ta.txt:1\taccepted\tBug\ta.txt: Fix 1\n")
+    (repo / "a.txt").write_text("fixed\n" + (repo / "a.txt").read_text())
+    g("commit", "-qam", "WIP round 1")
+    code, out = mmr("close", "--tests", "make test")
+    check(code == 0 and "Full sweep 2" in out, "split sweep 1 closes")
+    code, out = mmr("next", "--phase", "code")
+    rd = run / "rounds" / "02"
+    meta = json.loads((rd / "round.json").read_text())
+    check(code == 0 and "whole" not in meta.get("parts", []) and meta.get("assign") == {"opus": []}
+          and "terra review every slice and the cross-file pass, in parallel." in out
+          and "opus: No pass this round" in out, "split sweep 2 gives Codex every slice and opus no pass")
+    code, out = mmr("codex", "--reviewer", "terra")
+    n_parts = len(meta["parts"])
+    check(code == 0 and f"{n_parts} of {n_parts} slice passes ok" in out, "terra runs every part of sweep 2")
+    code, out = mmr("barrier")
+    check(code == 0 and "opus" not in out, "split sweep 2's barrier needs only terra")
+
     # A failed slice: the monitor reports it and the rest, and only that slice reruns.
     mmr("stop", "--reason", "Next scenario.")
     check(mmr("init", "--base", "main", "--intent-file", str(intent), "--new", e=small)[0] == 0, "failing split run")
@@ -515,7 +544,13 @@ def sweep_tests(tmp, env, intent):
     edit({i: f"c1 {i}" for i in range(3, 11)}, "c1")
     check(mmr("init", "--base", "main", "--intent-file", str(intent))[0] == 0, "sweep run starts")
     run = latest_run(repo, env)
-    check(json.loads((run / "run.json").read_text())["full_sweeps"] == 4, "new runs store the sweep cap")
+    state = json.loads((run / "run.json").read_text())
+    check(state["full_sweeps"] == 4 and state["sweep_min_old"] == 2 and state["codex_sweeps_from"] == 2,
+          "new runs store the sweep cap and rule")
+    # This scenario is a run saved before the sweep rule: It sweeps again on 1 seen-in-full bug, with every reviewer.
+    for key in ("sweep_min_old", "codex_sweeps_from"):
+        state.pop(key)
+    (run / "run.json").write_text(json.dumps(state))
 
     code, out = mmr("next", "--phase", "code")
     check(code == 0 and "full" in out and "Full sweep 1" in out, "round 1 is sweep 1")
@@ -525,7 +560,8 @@ def sweep_tests(tmp, env, intent):
     check(code == 0 and "Full sweep 2" in out and "1 newer" in out, "sweep 1's fixes lead to sweep 2")
 
     code, out = mmr("next", "--phase", "code")
-    check(code == 0 and "full range" in out, "round 2 is full")
+    check(code == 0 and "full range" in out and "Claude Agent opus:" in out and "No pass" not in out,
+          "round 2 is full, with every reviewer in an older run")
     check("This is full sweep 2" in (run / "rounds" / "02" / "prompt.md").read_text(), "sweep 2 says so")
     review(2, ["P1\tsrc/deep/f.txt:5\taccepted\tMissed by sweep 1\tf.txt: Fix 7"])
     edit({7: "c3 7"}, "WIP round 2")
@@ -637,6 +673,56 @@ def sweep_tests(tmp, env, intent):
     code, out = mmr("next", "--phase", "final")
     check(code == 0 and "Nothing changed since the last full sweep" in out, "Final with nothing to check converges")
     check(json.loads((run / "run.json").read_text())["phases"]["final"] == "converged", "Final is marked converged")
+
+    # New runs: Another sweep needs 2+ accepted P0/P1 on old code (swept or older than the branch),
+    # and from sweep 2 on only Codex reviewers sweep.
+    mmr("stop", "--reason", "Next scenario.")
+    check(mmr("init", "--base", "main", "--intent-file", str(intent), "--new")[0] == 0, "sweep-rule run starts")
+    run = latest_run(repo, env)
+    code, out = mmr("next", "--phase", "code")
+    check(code == 0 and "Claude Agent opus:" in out and "No pass" not in out, "sweep 1 has every reviewer")
+    review(1, ["P1\tsrc/deep/f.txt:9\taccepted\tFix bug\tf.txt: Fix 9"])
+    edit({9: "d1 9"}, "WIP rule round 1")
+    code, out = mmr("close", "--tests", "make test")
+    check(code == 0 and "Full sweep 2, after sweep 1's fixes" in out, "sweep 2 always follows a non-clean sweep 1")
+    code, out = mmr("next", "--phase", "code")
+    rd = run / "rounds" / "02"
+    check(code == 0 and "opus: No pass this round. From full sweep 2 on, only terra sweeps." in out
+          and "Claude Agent" not in out, "sweep 2 is for Codex reviewers only")
+    check(json.loads((rd / "round.json").read_text()).get("assign") == {"opus": []}, "the round gives opus no pass")
+    check("  opus: no pass this round" in mmr("status")[1], "status shows who sits out")
+    modes.write_text("finding")
+    check(mmr("codex", "--reviewer", "terra")[0] == 0, "terra sweeps alone")
+    (rd / "opus.answer.md").write_text("NO BLOCKING ISSUES.")
+    code, out = mmr("claude-result", "--seconds", "1")
+    check(code == 1 and "opus has no pass in this round" in out, "an answer from a reviewer who sat out is refused")
+    code, out = mmr("barrier")
+    check(code == 0 and "terra: ok" in out and "opus" not in out, "the barrier waits only for terra")
+    (rd / "triage.tsv").write_text(HEADER + "terra,opus\tP1\tsrc/deep/f.txt:5\taccepted\tSwept line\tf.txt: Fix 5\n")
+    edit({5: "d2 5", 1: "d2 1"}, "WIP rule round 2")
+    code, out = mmr("close", "--tests", "make test")
+    check(code == 1 and "Bad reviewers" in out, "a reviewer who sat out can't be credited")
+    (rd / "triage.tsv").write_text(HEADER + "terra\tP1\tsrc/deep/f.txt:5\taccepted\tSwept line\tf.txt: Fix 5\n"
+                                   + "terra\tP1\tsrc/deep/f.txt:1\taccepted\tBase line\tf.txt: Fix 1\n")
+    code, out = mmr("close", "--tests", "make test")
+    check(code == 0 and "Full sweep 3: Sweep 2 found 2 accepted P0/P1 on old code" in out
+          and "1 before-branch, 1 seen-in-full" in out, "two bugs on old code lead to sweep 3")
+    check(mmr("next", "--phase", "code")[0] == 0, "sweep 3 opens")
+    review(3, ["P1\tsrc/deep/f.txt:3\taccepted\tOne more\tf.txt: Fix 3"])
+    edit({3: "d3 3"}, "WIP rule round 3")
+    code, out = mmr("close", "--tests", "make test")
+    check(code == 0 and "Sweep 3 found 1 accepted P0/P1 on old code, under 2, so delta rounds check the fixes" in out,
+          "one bug on old code ends the sweeps")
+    code, out = mmr("next", "--phase", "code")
+    check(code == 0 and "delta range" in out and "Claude Agent opus:" in out, "delta rounds have every reviewer")
+    modes.write_text("clean")
+    mmr("codex", "--reviewer", "terra")
+    (run / "rounds" / "04" / "opus.answer.md").write_text("NO BLOCKING ISSUES.")
+    check(mmr("claude-result", "--seconds", "1")[0] == 0, "opus answers the delta round")
+    check(mmr("close")[0] == 0, "sweep-rule run converges")
+    report = mmr("report")[1]
+    check("Full Code sweeps: 3 (rounds 1, 2, 3). Accepted P0/P1 on old code: round 2: 2, round 3: 1" in report
+          and "| opus | 0 | 0 | 0 | 0 | 0 | 0 | 2 |" in report, "report counts old-code bugs and opus's passes")
 
 
 def legacy_findings_tests(tmp, env, intent):
@@ -830,6 +916,10 @@ def main():
     check(mmr("init", "--base", "main")[0] == 1, "refuses missing intent")
     check(mmr("init", "--base", "main", "--intent-file", str(intent))[0] == 0, "init")
     check(mmr("init", "--base", "main", "--intent-file", str(intent))[0] == 1, "refuses second run")
+    # Every reviewer sweeps in this run, as in runs saved before codex_sweeps_from, so round 2 can merge two.
+    state = json.loads((run_dir() / "run.json").read_text())
+    state.pop("codex_sweeps_from")
+    (run_dir() / "run.json").write_text(json.dumps(state))
     check(subprocess.run(["git", "status", "--porcelain"], cwd=repo, capture_output=True,
                          text=True).stdout == "", "run folder leaves the tree clean")
 
