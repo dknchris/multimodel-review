@@ -30,7 +30,7 @@ Below, `mmr <command>` is short for that full call.
 
 ## Start or resume
 
-1. Run `mmr status`. If an unfinished run exists, continue from what it shows, with the reviewers it lists. If it says "Old location", run `mmr migrate` once every reviewer has finished, then use only the new path.
+1. Run `mmr status`. If an unfinished run exists, continue from its `Next:` line, with the reviewers it lists. If it names a hand-off brief, read it: It holds the last session's notes. If this session did other work before /multimodel-review and no round is open, do the Hand-off first. If it says "Old location", run `mmr migrate` once every reviewer has finished, then use only the new path.
 2. Choose options, before any other step, so the owner sees them right away:
    - If the Options line above is only `pick` (or `picker`): Show the picker (next two bullets).
    - Otherwise, whether it's empty or not: Run `mmr options "<options>"` and show no picker. Empty means the defaults, `terra:max opus:xhigh code:20 spare:2`. If it fails, show the owner its one-line error and stop. Each reviewer is `name[:effort][:fast]`: Effort defaults to max for Codex and xhigh for Claude models, and a Codex model runs at standard speed unless `:fast` is given. `code:<20-50>` and `spare:<2-6>` are optional (defaults 20 and 2).
@@ -44,6 +44,7 @@ Below, `mmr <command>` is short for that full call.
    - Exit code 5 means some files look like secrets, are over 20 MB, or are embedded repositories. Nothing has changed yet. Ask the owner with buttons: Leave them out (`--leave-out`) or include them (`--allow-flagged`).
    - "Nothing to review" means no commits and no uncommitted work. Ask the owner which commits to review, then pass `--base <commit>`.
 6. Tell the owner in one line if init created a branch or a snapshot.
+7. Unless this review is this session's first task, do the Hand-off now, before round 1.
 
 ## One round
 
@@ -63,7 +64,7 @@ Below, `mmr <command>` is short for that full call.
 5. Run `mmr barrier`. Edit nothing until it passes. If a result is empty or missing, rerun only that reviewer, at the same commit; the round doesn't count again. In a split round, rerun only that reviewer's failed slice: `mmr codex --reviewer <name> --slice <slice>` with its own `mmr monitor --reviewer <name> --slice <slice>`. For a Claude reviewer, spawn a fresh Agent and repeat step 4. The helper refuses a third attempt and any rerun after a stall or timeout: Then run `mmr stop --reason "<why>"` and go to Done. Exception: A run from before the format rules were dropped may show `malformed` on a real answer. Run `mmr reread --reviewer <who>`, which reads the saved answer again with no new reviewer run.
 6. Triage (see Fixer rules), and write `triage.tsv` in the round folder with the Write tool. In a split round, the barrier writes `answers.md` in the round folder: Every part's answers, the `whole` pass included, with findings at nearby lines listed as likely duplicates. Triage from it, one row per merged finding across slices; `close` also merges rows with the same `loc` and summary. In Final, run `mmr ages` after writing `triage.tsv` and before fixing: It marks late rows and says which to fix (late P0) and which to list as `open` (late P1).
 7. Fix accepted findings, run the affected tests, and make one WIP commit. A failing test blocks the round, so a bad fix can't reach the next delta.
-8. Run `mmr close --tests "<exact test command>"`, or `--tests "none: docs only"`. With nothing accepted, omit `--tests`. Follow the `Next:` line it prints.
+8. Run `mmr close --tests "<exact test command>"`, or `--tests "none: docs only"`. With nothing accepted, omit `--tests`. Follow the `Next:` line it prints. If it says `Hand-off due` (every 8 rounds), do the Hand-off first.
 
 `triage.tsv` is tab-separated, one row per merged finding, and can be omitted only if every reviewer answered "NO BLOCKING ISSUES.":
 
@@ -98,6 +99,20 @@ WIP commits: Message `WIP multimodel-review round <N>`, written to a file and pa
 - A phase converges at its first clean round.
 - New evidence after Code converges (device or emulator run): Update the affected code or text once, commit, then run `mmr next --phase evidence --note "<what the run showed and what changed>"`, one delta round at P0/P1/P2. Code reopens only if a P0/P1 is accepted, and `close` says so.
 - At a phase cap or the hard stop: Stop and report what's left.
+
+## Hand-off
+
+This session's context is most of a review's cost, because every step reads it again. The run's state is on disk, so a fresh session can take over between rounds. Hand off right after init unless the review is this session's first task, and when `close` or `status` says `Hand-off due`.
+
+1. Hand off only between rounds: An open round's reviewers report to the session that started them, so `mmr handoff` refuses one.
+2. If the owner decided something in this session that the run folder doesn't hold, such as a path to leave alone or a pending device test, Write it to a scratchpad notes file.
+3. Run `mmr handoff`, adding `--notes <file>` if you wrote one. It saves a brief as `handoff.md` in the run folder, prints it, and counts the hand-off, so the next one is due 8 rounds later even if the owner stays here.
+4. Offer the fresh session:
+   - With a start_session tool (desktop app): Offer a session with title "Continue multimodel-review", fresh context, on Opus 5.5 at high effort, in this same checkout (no new worktree: The run's commits are on this branch), with the brief, unchanged, as its prompt. The owner picks the new session or this one.
+   - In a terminal: Ask with buttons: "Fresh session (Recommended)" or "Continue here". For a fresh session, tell the owner to type `/clear`, then `/multimodel-review`; the run resumes from disk.
+5. If the owner takes the fresh session, stop: This session does nothing more on the run, even when that session's notes arrive here. Otherwise continue from the `Next:` line.
+
+Runs started before this change print no `Hand-off due`, but `mmr handoff` works on them too.
 
 ## Fixer rules
 

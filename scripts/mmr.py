@@ -73,6 +73,10 @@ OLD_CODE = ("seen-in-full", "before-branch")
 # From this sweep on, only Codex reviewers sweep when the panel has one: After sweep 1, a Claude pass costs
 # about $3.80 and found few bugs alone. Runs saved without "codex_sweeps_from" keep every reviewer.
 CODEX_SWEEPS_FROM = 2
+# The session's context is most of a review's cost, and the run's state is on disk, so a fresh session can take
+# over between rounds. close asks for a hand-off once this many rounds ran since the last one (about 200k tokens
+# of context). Runs saved without "handoff_rounds" never ask.
+HANDOFF_ROUNDS = 8
 # How old a finding's code is, from git blame. Oldest first; "unknown" when blame can't place it.
 AGES = ["before-branch", "seen-in-full", "newer"]
 ALLOWED = {
@@ -664,13 +668,16 @@ def cmd_init(a):
         "slices": {"over": SLICE_OVER, "max": SLICE_MAX, "in_slice": True},
         "full_sweeps": min(FULL_SWEEPS, run_caps["code"]),
         "sweep_min_old": SWEEP_MIN_OLD, "codex_sweeps_from": CODEX_SWEEPS_FROM, "final_check": True,
+        "handoff_rounds": HANDOFF_ROUNDS, "handoffs": [],
         "phase_rounds": {"code": 0, "docs": 0, "final": 0, "evidence": 0},
         "phases": {"code": "pending", "docs": "pending", "final": "pending"},
         "open_round": None, "last_reviewed": None, "stopped": None, "finished": False,
     })
     (root / "latest").write_text(name + "\n")
     print(f"Run: {run}\nBranch: {branch}\nBase: {base} at {merge_base[:12]}\n"
-          f"{settings_line(read_json(run / 'run.json'))}\nNext: mmr.py next --phase code")
+          f"{settings_line(read_json(run / 'run.json'))}\n"
+          "Hand-off: Unless this review is this session's first task, run mmr.py handoff and offer a fresh "
+          "session now (SKILL.md, Hand-off).\nNext: mmr.py next --phase code")
 
 
 def read_tsv(path):
@@ -1451,12 +1458,77 @@ def cmd_close(a):
         s["stopped"] = f"Hard stop at {max_rounds(s)} rounds."
     if s["stopped"]:
         message = f"STOP: {s['stopped']} Next: Done steps."
+    due = handoff_due(s)
+    if due:
+        message = (f"Hand-off due: {due} rounds ran since the last hand-off. Run mmr.py handoff and offer a fresh "
+                   "session before the next step (SKILL.md, Hand-off). " + message)
     save(run, s)
     ages = [row["age"] for row in rows]
     dated = ", ".join(f"{ages.count(age)} {age}" for age in AGES + ["unknown"] if age in ages)
     print(f"Round {n} closed: {'clean' if clean else 'not clean'}; "
           f"{len(accepted)} accepted, {len(rejected)} rejected, {len(held) + len(listed)} open."
           + (f" Code dated by git blame: {dated}." if dated else "") + f"\n{message}")
+
+
+def next_step(run, s):
+    """What the run needs next, from its saved state, so a fresh or compacted session can pick it up."""
+    if s.get("finished"):
+        return "Nothing: The run is finished."
+    if s["stopped"]:
+        return "Done steps."
+    if s["open_round"]:
+        return (f"Finish round {s['open_round']}: Start any reviewer that hasn't started, wait for the rest, "
+                "then mmr.py barrier, triage, fix and close.")
+    phases = s["phases"]
+    if phases["code"] in ("pending", "open", "reopened"):
+        return "mmr.py next --phase code"
+    if not (run / "cleanup.md").exists():
+        return f"Cleanup, then write {run / 'cleanup.md'}"
+    if phases["docs"] in ("pending", "open"):
+        return "mmr.py next --phase docs"
+    if phases["final"] != "converged":
+        return "mmr.py next --phase final"
+    return "Done steps."
+
+
+def handoff_due(s):
+    """Rounds since the last hand-off, once they reach the run's handoff_rounds and work is left; else 0."""
+    every = s.get("handoff_rounds")
+    if not every or s["stopped"] or s.get("finished") or s["phases"]["final"] == "converged":
+        return 0
+    since = s["rounds"] - max((h["after_round"] for h in s.get("handoffs", [])), default=0)
+    return since if since >= every else 0
+
+
+def cmd_handoff(a):
+    """Write a brief that lets a fresh session resume this run, and count the hand-off. Between rounds only."""
+    run, s = load(a.repo)
+    if s.get("finished"):
+        die("The run is finished: Nothing to hand off.")
+    if s["open_round"]:
+        die(f"Round {s['open_round']} is open. Hand off only between rounds: Its reviewers report to this session.")
+    notes = Path(a.notes).read_text().strip() if a.notes else ""
+    tests = [r["tests"] for r in read_tsv(run / "rounds.tsv") if r.get("tests")]
+    status = f"python3 {Path(__file__).resolve()} --repo {s['repo']} status"
+    brief = "\n".join([
+        "Continue a multimodel-review run in this fresh session. The owner started it with /multimodel-review "
+        "and accepted this hand-off, and its state is on disk, so the skill applies here.", "",
+        f"1. Read {SKILL_DIR / 'SKILL.md'} in full and follow it.",
+        f"2. Run `{status}` and continue from its Next line. Don't run init or start a new run.",
+        f"3. Work in {s['repo']} on branch {s['branch']}, and don't switch branches.", "",
+        f"Run folder: {run}",
+        f"Intent: {run / 'intent.md'}",
+        settings_line(s),
+        f"Rounds used: {s['rounds']} of {max_rounds(s)}. Phases: "
+        + ", ".join(f"{k} {v}" for k, v in s["phases"].items()),
+        f"Last test command: {tests[-1] if tests else 'None yet'}",
+        f"Next: {next_step(run, s)}",
+        *(["", "Notes from the last session:", "", notes] if notes else []),
+    ])
+    (run / "handoff.md").write_text(brief + "\n")
+    s.setdefault("handoffs", []).append({"after_round": s["rounds"], "at": now()})
+    save(run, s)
+    print(f"Brief saved: {run / 'handoff.md'}\n\n{brief}")
 
 
 def cmd_status(a):
@@ -1479,6 +1551,11 @@ def cmd_status(a):
                 print(f"  {who}: no pass this round")
             for pd in pass_dirs(rd, who):
                 print(f"  {label(who, pd)}: {reviewer_status(pd, who)}")
+    if (run / "handoff.md").exists():
+        print(f"Last hand-off brief: {run / 'handoff.md'}")
+    if handoff_due(s) and not s["open_round"]:
+        print(f"Hand-off due: {handoff_due(s)} rounds ran since the last hand-off (SKILL.md, Hand-off).")
+    print(f"Next: {next_step(run, s)}")
 
 
 def cmd_migrate(a):
@@ -1782,6 +1859,9 @@ def main():
     c = sub.add_parser("stop")
     c.add_argument("--reason", required=True)
     c.set_defaults(fn=cmd_stop)
+    c = sub.add_parser("handoff", help="Write a brief for a fresh session that resumes the run; between rounds only")
+    c.add_argument("--notes", help="A file with what the owner decided in this session that the run folder lacks")
+    c.set_defaults(fn=cmd_handoff)
     for name, fn in (("barrier", cmd_barrier), ("status", cmd_status), ("migrate", cmd_migrate),
                      ("report", cmd_report), ("archive", cmd_archive)):
         sub.add_parser(name).set_defaults(fn=fn)

@@ -755,6 +755,92 @@ def sweep_tests(tmp, env, intent):
           and "| opus | 0 | 0 | 0 | 0 | 0 | 0 | 2 |" in report, "report counts old-code bugs and opus's passes")
 
 
+def handoff_tests(tmp, env, intent):
+    """A fresh session can take a run over between rounds: status names the next step, handoff writes the
+    brief, and close asks for a hand-off once handoff_rounds rounds ran since the last one."""
+    repo = tmp / "handoff"
+    repo.mkdir()
+    modes = Path(env["FAKE_MODE_FILE"])
+
+    def g(*args):
+        subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t.t", *args], cwd=repo, capture_output=True)
+
+    def mmr(*args):
+        r = subprocess.run([sys.executable, MMR, "--repo", str(repo), *args], capture_output=True,
+                           text=True, env={**env, **GIT_ID}, timeout=90)
+        return r.returncode, r.stdout + r.stderr
+
+    def round_(n, text):
+        """One Code round: terra finds a bug, opus (if it has a pass) finds none, the fix is committed."""
+        modes.write_text("finding")
+        mmr("codex", "--reviewer", "terra")
+        rd = latest_run(repo, env) / "rounds" / f"{n:02d}"
+        (rd / "opus.answer.md").write_text("NO BLOCKING ISSUES.")
+        mmr("claude-result", "--seconds", "1")
+        (rd / "triage.tsv").write_text(HEADER + f"terra\tP1\ta.txt:1\taccepted\tBug {n}\ta.txt: {text}\n")
+        (repo / "a.txt").write_text(text + "\n")
+        g("commit", "-qam", f"WIP round {n}")
+        return mmr("close", "--tests", "make test")
+
+    (repo / "a.txt").write_text("one\n")
+    g("init", "-q", "-b", "main")
+    g("add", "-A")
+    g("commit", "-qm", "one")
+    g("checkout", "-qb", "feature")
+    (repo / "a.txt").write_text("two\n")
+    g("commit", "-qam", "two")
+    code, out = mmr("init", "--base", "main", "--intent-file", str(intent))
+    check(code == 0 and "Hand-off: Unless this review is this session's first task" in out, "init offers a hand-off")
+    run = latest_run(repo, env)
+    state = json.loads((run / "run.json").read_text())
+    check(state["handoff_rounds"] == 8 and state["handoffs"] == [], "new runs store the hand-off interval")
+    state["handoff_rounds"] = 2
+    (run / "run.json").write_text(json.dumps(state))
+    check(mmr("status")[1].rstrip().endswith("Next: mmr.py next --phase code"), "status names the next step")
+    check(mmr("next", "--phase", "code")[0] == 0, "hand-off round 1")
+    code, out = mmr("handoff")
+    check(code == 1 and "Hand off only between rounds" in out, "no hand-off while a round is open")
+    check("Next: Finish round 1: Start any reviewer" in mmr("status")[1], "status names an open round's step")
+    code, out = round_(1, "three")
+    check(code == 0 and "Hand-off" not in out, "no hand-off after one round")
+    check(mmr("next", "--phase", "code")[0] == 0, "hand-off round 2")
+    code, out = round_(2, "four")
+    check(code == 0 and "Hand-off due: 2 rounds ran since the last hand-off. Run mmr.py handoff" in out
+          and out.rstrip().endswith("Next: mmr.py next --phase code"), "close asks for a hand-off after 2 rounds")
+    check("Hand-off due: 2 rounds" in mmr("status")[1], "status shows the hand-off is due")
+    notes = tmp / "handoff-notes.md"
+    notes.write_text("The owner said to leave b.txt alone.\n")
+    code, out = mmr("handoff", "--notes", str(notes))
+    brief = (run / "handoff.md").read_text()
+    check(code == 0 and brief.strip() in out and "SKILL.md in full" in brief and f"--repo {state['repo']} status" in brief
+          and f"Run folder: {run}" in brief and "Next: mmr.py next --phase code" in brief
+          and "Last test command: make test" in brief and "leave b.txt alone" in brief
+          and "branch feature" in brief, "handoff writes a brief a fresh session can follow")
+    handoffs = json.loads((run / "run.json").read_text())["handoffs"]
+    check([h["after_round"] for h in handoffs] == [2], "the hand-off is counted")
+    out = mmr("status")[1]
+    check("Hand-off due" not in out and f"Last hand-off brief: {run / 'handoff.md'}" in out,
+          "a hand-off resets the count, and status points to the brief")
+    check(mmr("next", "--phase", "code")[0] == 0, "hand-off round 3")
+    modes.write_text("clean")
+    mmr("codex", "--reviewer", "terra")
+    (run / "rounds" / "03" / "opus.answer.md").write_text("NO BLOCKING ISSUES.")
+    mmr("claude-result", "--seconds", "1")
+    code, out = mmr("close")
+    check(code == 0 and "Code converged" in out and "Hand-off" not in out, "no hand-off right after one")
+    check(f"Next: Cleanup, then write {run / 'cleanup.md'}" in mmr("status")[1], "status names Cleanup")
+    (run / "cleanup.md").write_text("Nothing.\n")
+    check("Next: mmr.py next --phase docs" in mmr("status")[1], "status names Docs")
+    mod = load_module()
+    check(mod.handoff_due({**state, "rounds": 9, "handoffs": []}) == 9
+          and mod.handoff_due({k: v for k, v in {**state, "rounds": 9}.items() if k != "handoff_rounds"}) == 0
+          and mod.handoff_due({**state, "rounds": 9, "stopped": "x"}) == 0, "older and stopped runs never ask")
+    mmr("stop", "--reason", "Done.")
+    check(mmr("archive")[0] == 0, "archive")
+    code, out = mmr("handoff")
+    check(code == 1 and "finished" in out, "a finished run has nothing to hand off")
+
+
 def legacy_findings_tests(tmp, env, intent):
     """A findings.tsv saved before the age column gains it at the next close; old rows read as undated."""
     repo = tmp / "legacy"
@@ -935,6 +1021,7 @@ def main():
     location_tests(tmp, env, intent)
     slice_tests(tmp, env, intent)
     sweep_tests(tmp, env, intent)
+    handoff_tests(tmp, env, intent)
     legacy_findings_tests(tmp, env, intent)
 
     sh("git", "init", "-q", "-b", "main")
