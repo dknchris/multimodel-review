@@ -13,7 +13,7 @@ It needs Python 3, git and the Codex CLI.
 
 ## Use
 
-- `/multimodel-review` starts the default panel: `terra:max:fast opus:xhigh code:20 spare:2`.
+- `/multimodel-review` starts the default panel: `terra:max opus:xhigh code:20 spare:2`. Fast mode is off unless you add `:fast`, because it draws more Codex usage.
 - `/multimodel-review astra:high fable sol:fast code:35` starts your own panel. Each reviewer is `name[:effort][:fast]`, and effort is low, medium, high, xhigh or max.
 - Reviewers: Codex terra, astra, sol and luna, and Claude opus, fable, sonnet and haiku. Fast mode is for the Codex models only.
 - `code:<20-50>` caps the Code phase (default 20), and `spare:<2-6>` adds rounds for re-checks after a device test (default 2). Docs and Final get 2 rounds each. Each phase ends at its first clean round.

@@ -847,7 +847,7 @@ def main():
     check("--disable apps" in flags and "--disable plugins" in flags and "--disable multi_agent" in flags,
           "apps, plugins and subagents off")
     check("danger" not in flags and "workspace-write" not in flags, "no write access flags")
-    check('service_tier="priority"' in flags, "fast mode is on by default")
+    check("service_tier" not in flags, "fast mode is off by default")
     check("web search" in (rd(1) / "prompt.md").read_text(), "prompt has the web rule")
     check(mmr("barrier")[0] == 1, "barrier blocks on malformed")
     modes.write_text("finding")
@@ -1158,8 +1158,8 @@ def main():
                                                      "(Code 20, Docs 2, Final 2, Spare 2)",
         "terra:fast opus": "Reviewers terra (max, fast), opus (xhigh); round limit 26",
         "terra:high astra:max": "Reviewers terra (high, standard), astra (max, standard); round limit 26",
-        "": "Reviewers terra (max, fast), opus (xhigh); round limit 26",
-        "code:35": "Reviewers terra (max, fast), opus (xhigh); round limit 41 (Code 35, Docs 2, Final 2, Spare 2)",
+        "": "Reviewers terra (max, standard), opus (xhigh); round limit 26",
+        "code:35": "Reviewers terra (max, standard), opus (xhigh); round limit 41 (Code 35, Docs 2, Final 2, Spare 2)",
         "terra code:50 spare:6": "round limit 60 (Code 50, Docs 2, Final 2, Spare 6)",
         "Terra:MAX:Fast, Opus": "Reviewers terra (max, fast), opus (xhigh); round limit 26",
         "terra:max opus:xhigh luna:low:fast spare:6.": "luna (low, fast); round limit 30",
@@ -1185,8 +1185,8 @@ def main():
     check(code == 1 and "Codex models only" in out, "init refuses a bad --spec")
     mmr("stop", "--reason", "Next scenario.")
     code, out = mmr("init", "--base", "main", "--intent-file", str(intent), "--new")
-    check(code == 0 and "Reviewers terra (max, fast), opus (xhigh); round limit 26" in out,
-          "plain init uses the new defaults")
+    check(code == 0 and "Reviewers terra (max, standard), opus (xhigh); round limit 26" in out,
+          "plain init uses the new defaults, with fast mode off")
 
     # Several Claude reviewers, each its own Agent model.
     mmr("stop", "--reason", "Next scenario.")

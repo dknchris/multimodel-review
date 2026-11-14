@@ -33,7 +33,8 @@ EFFORTS = ["low", "medium", "high", "xhigh", "max"]  # Codex "ultra" delegates t
 OLD_REVIEWERS = ["sol", "terra", "claude"]  # Runs from before Sol was dropped keep their panel.
 EFFORT = os.environ.get("MMR_EFFORT", "max")  # Default Codex effort; a run's own choice wins.
 CLAUDE_EFFORT = "xhigh"  # New runs; runs saved without an effort used high for Claude.
-DEFAULT_SPEC = "terra:max:fast opus:xhigh"
+# Fast mode (priority tier) is off unless asked for: It draws more Codex usage per pass.
+DEFAULT_SPEC = "terra:max opus:xhigh"
 CODEX = os.environ.get("MMR_CODEX_BIN", "codex")
 CAP_SECONDS = int(os.environ.get("MMR_CAP_SECONDS", "3600"))
 SILENCE_SECONDS = int(os.environ.get("MMR_SILENCE_SECONDS", "600"))
@@ -1681,7 +1682,7 @@ def main():
     c.add_argument("--trailer")
     c.add_argument("--leave-out", action="append", default=[])
     c.add_argument("--allow-flagged", action="store_true")
-    c.add_argument("--fast", default="on",
+    c.add_argument("--fast", default="off",
                    help="Codex priority (fast) tier: on, off, or the Codex reviewers that run fast (terra,luna)")
     c.add_argument("--effort", help="Per-reviewer effort, such as terra=max,opus=high")
     c.add_argument("--reviewers", default=",".join(REVIEWERS))
