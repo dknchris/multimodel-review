@@ -20,7 +20,7 @@ It needs Python 3, git and the Codex CLI.
 - `/multimodel-review pick` opens a picker.
 - Code sweeps the full diff again after each fix. Sweep 2 always runs after a sweep 1 with fixes; after that, another sweep runs only if the last one found 2 or more bugs on old code (code an earlier sweep reviewed, or older than the branch). There are at most 4 sweeps, and from sweep 2 on only the Codex reviewers sweep. Then delta rounds check the fixes. Each finding is dated with git blame.
 - Final checks the code written since the last full sweep. A Final finding on code a sweep already reviewed is tagged late: Late P0s are fixed, and late P1s are listed in the report.
-- A full-scope round whose diff is over 60 KB is split by folder into slices of at most 40 KB. Codex reviewers review each slice plus a cross-file pass, and each Claude reviewer reviews the whole diff once. All passes run in parallel.
+- A full-scope round whose diff is over 60 KB is split by folder into slices of at most 40 KB. Codex reviewers review each slice plus a cross-file pass, and each Claude reviewer reviews the whole diff once. All passes run in parallel. A slice pass reports only bugs that its own slice can trigger, and the cross-file pass checks doubts that depend on other slices.
 
 ## Test
 

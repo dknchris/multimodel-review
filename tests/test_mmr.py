@@ -344,8 +344,8 @@ def slice_tests(tmp, env, intent):
     code, out = mmr("init", "--base", "main", "--intent-file", str(intent), e=small)
     check(code == 0, "split run starts")
     run = latest_run(repo, env)
-    check(json.loads((run / "run.json").read_text())["slices"] == {"over": 2000, "max": 1500},
-          "the run keeps its split sizes")
+    check(json.loads((run / "run.json").read_text())["slices"] == {"over": 2000, "max": 1500, "in_slice": True},
+          "the run keeps its split sizes and slice prompt")
     # MMR_CLAUDE_SLICES=1: Every reviewer reviews every slice, as before the whole-diff pass.
     code, out = mmr("next", "--phase", "code", e={**env, "MMR_CLAUDE_SLICES": "1"})
     rd = run / "rounds" / "01"
@@ -356,10 +356,14 @@ def slice_tests(tmp, env, intent):
     s1 = (rd / "s1" / "prompt.md").read_text()
     check(f"Diff file: {rd / 's1' / 'diff.patch'}" in s1 and "Slice: s1 of" in s1 and "Files in this slice" in s1,
           "a slice prompt names its own diff and files")
+    check("Report only P0/P1 bugs that something in this slice can trigger" in s1
+          and "belongs to the cross-file pass, so leave it out" in s1 and "Focus on these files" not in s1,
+          "a slice reports only what its own slice can trigger")
     cross = (rd / "cross" / "prompt.md").read_text()
     check("Cross-file pass" in cross and str(rd / "diff.patch") in cross
           and "@@" in (rd / "cross" / "diff.patch").read_text()
           and "+src/app" not in (rd / "cross" / "diff.patch").read_text(), "the cross pass gets hunk headers only")
+    check("They leave you every doubt that depends on another slice" in cross, "the cross pass takes the doubts")
     check(all(f"Claude Agent opus {p}: model opus" in out for p in parts) and "Codex terra:" in out,
           "next lists a Claude Agent per slice")
     modes.write_text("finding")
@@ -502,6 +506,32 @@ def slice_tests(tmp, env, intent):
     (run / "run.json").write_text(json.dumps(state))
     code, out = mmr("next", "--phase", "code", e=small)
     check(code == 0 and "Split" not in out and "Prompt:" in out, "older runs never split")
+
+    # A run saved before in_slice keeps the older slice prompt.
+    mmr("stop", "--reason", "Next scenario.")
+    check(mmr("init", "--base", "main", "--intent-file", str(intent), "--new", e=small)[0] == 0, "older slice run")
+    run = latest_run(repo, env)
+    state = json.loads((run / "run.json").read_text())
+    state["slices"].pop("in_slice")
+    (run / "run.json").write_text(json.dumps(state))
+    check(mmr("next", "--phase", "code")[0] == 0, "older slice round")
+    rd = run / "rounds" / "01"
+    s1, cross = (rd / "s1" / "prompt.md").read_text(), (rd / "cross" / "prompt.md").read_text()
+    check("Focus on these files, and report a problem elsewhere only if this slice's code causes it" in s1
+          and "can trigger" not in s1 and "every doubt" not in cross, "an older run keeps the older slice prompt")
+
+    # A split Docs round asks each slice for false text in its own files.
+    mmr("stop", "--reason", "Next scenario.")
+    check(mmr("init", "--base", "main", "--intent-file", str(intent), "--new", e=small)[0] == 0, "split docs run")
+    run = latest_run(repo, env)
+    state = json.loads((run / "run.json").read_text())
+    state["phases"]["code"] = "converged"
+    (run / "run.json").write_text(json.dumps(state))
+    (run / "cleanup.md").write_text("Nothing.\n")
+    check(mmr("next", "--phase", "docs")[0] == 0, "split docs round")
+    s1 = (run / "rounds" / "01" / "s1" / "prompt.md").read_text()
+    check("Report only P2 problems in the text of these files." in s1 and "can trigger" not in s1,
+          "a docs slice asks for false text in its own files")
 
 
 def sweep_tests(tmp, env, intent):

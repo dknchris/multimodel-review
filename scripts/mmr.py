@@ -52,6 +52,8 @@ OLD_CAPS = {"code": 12, "docs": 2, "final": 2}  # Runs saved before the caps wer
 OLD_HARD_STOP = 18
 # A full-scope diff over SLICE_OVER bytes is split by folder into slices of at most SLICE_MAX bytes,
 # each with its own reviewer pass, plus one cross-file pass. Runs saved without these never split.
+# In runs saved with slices.in_slice, a slice pass reports only what its own slice can trigger, to cut
+# rejected findings; doubts about other slices go to the cross-file pass.
 SLICE_OVER = int(os.environ.get("MMR_SLICE_OVER", str(60 * 1024)))
 SLICE_MAX = int(os.environ.get("MMR_SLICE_MAX", str(40 * 1024)))
 CROSS = "cross"
@@ -659,7 +661,8 @@ def cmd_init(a):
         "reviewers": reviewers, "fast": fast, "effort": effort, "max_rounds": rounds, "caps": run_caps,
         "start_head": head, "started_at": now(), "rounds": 0,
         "created_branch": created, "snapshot_commit": snapshot, "left_out": left_out,
-        "slices": {"over": SLICE_OVER, "max": SLICE_MAX}, "full_sweeps": min(FULL_SWEEPS, run_caps["code"]),
+        "slices": {"over": SLICE_OVER, "max": SLICE_MAX, "in_slice": True},
+        "full_sweeps": min(FULL_SWEEPS, run_caps["code"]),
         "sweep_min_old": SWEEP_MIN_OLD, "codex_sweeps_from": CODEX_SWEEPS_FROM, "final_check": True,
         "phase_rounds": {"code": 0, "docs": 0, "final": 0, "evidence": 0},
         "phases": {"code": "pending", "docs": "pending", "final": "pending"},
@@ -933,6 +936,13 @@ def cmd_next(a):
     meta = {"round": n, "phase": phase, "phase_round": pr, "scope": scope,
             "commit": head, "range_start": start, "started_at": now()}
     lines = []
+    # Runs saved with slices.in_slice: A slice pass reports only what its own slice can trigger, and leaves
+    # doubts about other slices to the cross-file pass.
+    in_slice = (f"Report only {sev_label} problems in the text of these files. " if phase == "docs" else
+                f"Report only {sev_label} bugs that something in this slice can trigger: an input, call or state "
+                "change in these files that leads to the failure, wherever the failure shows. ") + (
+        "A doubt that depends on how code in another slice behaves, such as a caller, a contract, a schema or "
+        "a config, belongs to the cross-file pass, so leave it out. You may open any file for context.")
     if names:
         size = kb(nbytes(diff))
         for name, items in zip(names, slices):
@@ -943,9 +953,11 @@ def cmd_next(a):
             listing = "\n".join(f"- {p} ({kb(sum(nbytes(t) for q, t in items if q == p))} KB)" for p in files)
             (pd / "prompt.md").write_text(prompt(pd / "diff.patch", (
                 f"{again}Review the full diff of the files in this slice. The round's diff is {size} KB, so it is split "
-                f"by folder into {len(names)} slices, each with its own pass, plus a cross-file pass. Focus on "
-                "these files, and report a problem elsewhere only if this slice's code causes it. You may open "
-                f"any file for context. Report {sev_label} only.\n\nFiles in this slice:\n{listing}"),
+                f"by folder into {len(names)} slices, each with its own pass, plus a cross-file pass. "
+                + (in_slice if split.get("in_slice") else
+                   "Focus on these files, and report a problem elsewhere only if this slice's code causes it. You may "
+                   f"open any file for context. Report {sev_label} only.")
+                + f"\n\nFiles in this slice:\n{listing}"),
                 [f"Slice: {name} of {len(names)}, plus a cross-file pass"]))
             lines.append(f"Slice {name}: {len(files)} file(s), {kb(nbytes((pd / 'diff.patch').read_text()))} KB, "
                          f"{slice_folder(items)}; prompt {pd / 'prompt.md'}")
@@ -958,7 +970,10 @@ def cmd_next(a):
                   "and ordering or shared state across modules")
         (pd / "prompt.md").write_text(prompt(pd / "diff.patch", (
             f"Cross-file pass. The round's diff is {size} KB, so it is split by folder into {len(names)} slices, "
-            f"and other passes review each slice line by line. Look only for problems that cross slices: {across}. "
+            "and other passes review each slice line by line"
+            + (", reporting only what their own slice can trigger. They leave you every doubt that depends on "
+               "another slice" if split.get("in_slice") else "")
+            + f". Look only for problems that cross slices: {across}. "
             "The diff file lists each slice's files with their hunk headers. "
             f"Read the whole diff ({rd / 'diff.patch'}) in parts as needed, and open any file for context. "
             f"Report {sev_label} only."), ["Slice: cross-file pass over every slice"]))
