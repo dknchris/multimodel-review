@@ -816,8 +816,8 @@ def handoff_tests(tmp, env, intent):
           and f"Run folder: {run}" in brief and "Next: mmr.py next --phase code" in brief
           and "Last test command: make test" in brief and "leave b.txt alone" in brief
           and "branch feature" in brief, "handoff writes a brief a fresh session can follow")
-    check(f"check that your working folder is {state['repo']}" in brief and "stop before any reviewer runs" in brief
-          and "change_directory" not in brief, "a session started in another worktree stops before any work")
+    check(f"check that your working folder is {state['repo']}" in brief and "call EnterWorktree with that path" in brief,
+          "a session started in another worktree enters the review checkout before any work")
     skill = (Path(MMR).resolve().parent.parent / "SKILL.md").read_text()
     check('`use_worktree: false`' in skill and '`context: "fresh"`' in skill,
           "SKILL.md hands off in the same checkout, with no new worktree")

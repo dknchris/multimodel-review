@@ -1516,9 +1516,9 @@ def cmd_handoff(a):
         f"1. Read {SKILL_DIR / 'SKILL.md'} in full and follow it.",
         f"2. Run `{status}` and continue from its Next line. Don't run init or start a new run.",
         f"3. Work in {s['repo']} on branch {s['branch']}, and don't switch branches.",
-        f"4. First check that your working folder is {s['repo']}. If it isn't, stop before any reviewer runs: "
-        "A hook blocks edits outside your own folder, and a session in its own worktree can't move. Tell the "
-        "owner in one line that the session that handed off continues the run.", "",
+        f"4. First check that your working folder is {s['repo']}. If it isn't, call EnterWorktree with that "
+        "path before anything else, then check the folder and branch again. A hook blocks edits outside your "
+        "own folder, and change_directory can't move a session that runs in its own worktree.", "",
         f"Run folder: {run}",
         f"Intent: {run / 'intent.md'}",
         settings_line(s),
